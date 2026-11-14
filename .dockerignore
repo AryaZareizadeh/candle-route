@@ -2,6 +2,7 @@
 .claude
 CLAUDE.md
 .github
+forecasting
 .venv*
 __pycache__
 .pytest_cache

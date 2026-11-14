@@ -20,7 +20,7 @@ function monitor(job) {
     active: (job) => ["queued", "running", "awaiting_decision"].includes(job.status),
     waiting: (job) => job.status === "awaiting_decision",
     count: String, number: String, duration: String, rateText: String,
-    showError() {}, renderDecision() {}, renderChart() {}, renderLogs() {}, updateActions() {},
+    showError() {}, renderDownloadCoins() {}, renderDecision() {}, renderChart() {}, renderLogs() {}, updateActions() {},
   };
   vm.runInNewContext(`${renderer}\nrenderMonitor();`, context);
   return Object.fromEntries(elements);

@@ -1,4 +1,18 @@
-# Nobitex trading dashboard
+# CandleRoute
+
+CandleRoute brings together crypto forecasting, strategy research, portfolio tracking,
+and Nobitex trading in one repository.
+
+- **Trading dashboard (`/`)** supports backtesting, paper trading, and live margin
+  execution on Nobitex. Follow the setup below to run it.
+- **Forecasting (`forecasting/`)** runs the Kronos, GRU, and LSTM research tools and
+  dashboard. Follow the [forecasting setup](forecasting/README.md) from that directory.
+
+The forecasting dashboard currently runs separately. The next integration milestone
+is to make Kronos forecasts available to portfolio research and paper trading in the
+trading dashboard.
+
+## Trading dashboard
 
 A Python dashboard for technical-analysis strategies, historical
 research, simulated trading, and Nobitex margin execution. The interface is plain
