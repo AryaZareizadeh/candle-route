@@ -605,7 +605,7 @@ def train_kronos(config, *, overwrite=False, data_kind="historical", progress=pr
                            _utc, _write_csv, _write_json)
     from .report import write_report
     from .kronos_artifacts import (data_signature, load_tokenizer_checkpoint,
-                                  save_tokenizer, tokenizer_summary)
+                                  save_predictor, save_tokenizer, tokenizer_summary)
     config.validate()
     if on_training_decision is not None and not callable(on_training_decision):
         raise ValueError("on_training_decision must be a callable or None.")
@@ -614,7 +614,7 @@ def train_kronos(config, *, overwrite=False, data_kind="historical", progress=pr
     if data_kind not in {"historical", "synthetic_demo"}:
         raise ValueError("data_kind must be historical or synthetic_demo.")
     run_dir = Path(config.run_dir)
-    if any((run_dir / name).exists() for name in ("model.pt", "tokenizer.pt")) and not overwrite:
+    if any((run_dir / name).exists() for name in ("model.pt", "tokenizer.pt", "predictor.pt")) and not overwrite:
         raise ValueError(f"{run_dir} already contains a trained run. Select another --run-dir or use --overwrite.")
     if config.kronos_tokenizer_run_dir and Path(config.kronos_tokenizer_run_dir).resolve() == run_dir.resolve():
         raise ValueError("Predictor training must use a new run directory to preserve its source tokenizer.")
@@ -713,6 +713,50 @@ def train_kronos(config, *, overwrite=False, data_kind="historical", progress=pr
     scheduler = LearningRateSchedule(optimizer, config, config.epochs, len(loader))
     history, best_loss, best_state, best_epoch, decisions = [], float("inf"), None, 0, []
     epoch, epoch_limit, extension_end = 0, config.epochs, None
+    input_note = "The amount channel is zero because source CSVs do not contain observed quote turnover."
+    kronos = {"timeframe": config.kronos_timeframe, "train_stride": config.kronos_train_stride,
+              "eval_stride": config.kronos_eval_stride, "model_path": config.kronos_model_path,
+              "tokenizer_path": config.kronos_tokenizer_path, "tokenizer_frozen": True,
+              "tokenizer_finetuned": tokenizer_training.get("enabled", False),
+              "tokenizer_source_run": config.kronos_tokenizer_run_dir,
+              "max_context": MAX_CONTEXT, "sample_count": config.kronos_sample_count,
+              "prediction_bars": _bars(config.kronos_timeframe, config.kronos_prediction_length).tolist(), "amount_note": input_note,
+              "normalization": "Each input lookback only; future bars use the same historical mean/std.",
+              "objective": "Mean next-token cross entropy of s1/s2 over future positions only.",
+              "sampled_counts": split_info["sampled_counts"], "validation_causal": True,
+              "forecast_device": str(device),
+              "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)}
+    interval_note = ("Empirical 80% validation-residual ranges, pooled across eligible coins per horizon. "
+                     "Validation also selects the epoch, so these are not independent calibration or guaranteed "
+                     "probabilities. Final-test coverage measures held-out behavior. Metrics use the saved "
+                     "per-coin evaluation stride; non-overlapping test origins are reported separately.")
+    metadata = {"format_version": 3 if config.kronos_prediction_length is None else 4, "package_version": __version__, "config": asdict(config),
+                "model_type": config.model_type, "input_mode": "single_timeframe",
+                "timeframes": [config.kronos_timeframe], "origin_interval": config.kronos_timeframe,
+                "coins": coins, "features": list(RAW_FEATURES), "horizons": horizons,
+                "residual_bounds": None, "data_kind": data_kind, "kronos": kronos,
+                "model_config": model_config, "tokenizer_config": tokenizer_config,
+                "tokenizer_training": tokenizer_training}
+    summary = {"created_at": datetime.now(timezone.utc).isoformat(), "package_version": __version__,
+               "data_kind": data_kind, "coins": coins, "config": asdict(config), "model_type": config.model_type,
+               "splits": split_info, "excluded_coins": excluded, "data_manifest": manifest,
+               "best_epoch": 0, "history": history, "metrics": {}, "interval_note": interval_note,
+               "parameters_changed": False, "torch_version": str(torch.__version__), "device": str(device),
+               "deterministic_algorithms": True, "kronos": kronos, "tokenizer_training": tokenizer_training}
+
+    def checkpoint_predictor(complete=False):
+        snapshot = {**summary, "artifact_type": "kronos-predictor", "data_signature": signature,
+                    "training_complete": complete, "evaluation_complete": False,
+                    "best_epoch": best_epoch, "best_validation_loss": best_loss,
+                    "parameters_changed": _state_hash(model) != initial_hash,
+                    "training_control": {"initial_epochs": config.epochs, "epoch_limit": epoch_limit,
+                                         "extension_epochs": 10, "epochs_completed": len(history), "decisions": decisions}}
+        save_predictor(run_dir, best_state,
+                       {key: value.detach().cpu() for key, value in tokenizer.state_dict().items()},
+                       {**metadata, **snapshot}, snapshot)
+        emit("checkpoint", checkpoint_path=str((run_dir / "predictor.pt").resolve()),
+             best_epoch=best_epoch, training_complete=complete, evaluation_complete=False)
+
     emit("stage", stage="training", counts=split_info["sampled_counts"], device=str(device),
          training_component="predictor", epoch=0, max_epochs=config.epochs, best_epoch=0,
          best_validation_loss=None, batch=0, total_batches=len(loader), train_loss=None, validation_loss=None,
@@ -749,6 +793,7 @@ def train_kronos(config, *, overwrite=False, data_kind="historical", progress=pr
         if validation_loss < best_loss - 1e-8:
             best_loss, best_epoch = validation_loss, epoch
             best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+            checkpoint_predictor()
         emit("epoch", stage="training", **history[-1], max_epochs=epoch_limit, best_epoch=best_epoch,
              best_validation_loss=best_loss)
         progress(f"Epoch {epoch}/{epoch_limit}: token cross entropy train={running_loss / seen:.6f}, "
@@ -774,6 +819,10 @@ def train_kronos(config, *, overwrite=False, data_kind="historical", progress=pr
             emit("stage", stage="training", max_epochs=epoch_limit)
     model.load_state_dict(best_state)
     changed = _state_hash(model) != initial_hash
+    # Never put generated candles, calibration, report writes or callbacks between
+    # completed training and its durable, self-contained recovery checkpoint.
+    checkpoint_predictor(complete=True)
+    progress(f"Saved best predictor (epoch {best_epoch}) to {(run_dir / 'predictor.pt').resolve()}; evaluating separately.")
     emit("stage", stage="evaluating")
     progress("Evaluating the frozen best checkpoint on its selected future candle targets.")
     validation_prediction = forecast_samples(model, tokenizer, validation_samples, config, device, emit)
@@ -786,40 +835,12 @@ def train_kronos(config, *, overwrite=False, data_kind="historical", progress=pr
                "test_non_overlapping": _metrics(test_samples, test_prediction, bounds, True, config.model_type, horizons=horizons)}
     for rows in metrics.values():
         _candle_rows(rows, config)
-    input_note = "The amount channel is zero because source CSVs do not contain observed quote turnover."
-    kronos = {"timeframe": config.kronos_timeframe, "train_stride": config.kronos_train_stride,
-              "eval_stride": config.kronos_eval_stride, "model_path": config.kronos_model_path,
-              "tokenizer_path": config.kronos_tokenizer_path, "tokenizer_frozen": True,
-               "tokenizer_finetuned": tokenizer_training.get("enabled", False),
-              "tokenizer_source_run": config.kronos_tokenizer_run_dir,
-              "max_context": MAX_CONTEXT, "sample_count": config.kronos_sample_count,
-              "prediction_bars": _bars(config.kronos_timeframe, config.kronos_prediction_length).tolist(), "amount_note": input_note,
-              "normalization": "Each input lookback only; future bars use the same historical mean/std.",
-              "objective": "Mean next-token cross entropy of s1/s2 over future positions only.",
-              "sampled_counts": split_info["sampled_counts"], "validation_causal": True,
-              "forecast_device": str(device),
-              "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)}
-    interval_note = ("Empirical 80% validation-residual ranges, pooled across eligible coins per horizon. "
-                     "Validation also selects the epoch, so these are not independent calibration or guaranteed "
-                     "probabilities. Final-test coverage measures held-out behavior. Metrics use the saved "
-                     "per-coin evaluation stride; non-overlapping test origins are reported separately.")
-    metadata = {"format_version": 3 if config.kronos_prediction_length is None else 4, "package_version": __version__, "config": asdict(config),
-                "model_type": config.model_type, "input_mode": "single_timeframe",
-                "timeframes": [config.kronos_timeframe], "origin_interval": config.kronos_timeframe,
-                "coins": coins, "features": list(RAW_FEATURES), "horizons": horizons,
-                "residual_bounds": bounds.tolist(), "data_kind": data_kind, "kronos": kronos,
-                "model_config": model_config, "tokenizer_config": tokenizer_config}
-    metadata["tokenizer_training"] = tokenizer_training
-    summary = {"created_at": datetime.now(timezone.utc).isoformat(), "package_version": __version__,
-               "data_kind": data_kind, "coins": coins, "config": asdict(config), "model_type": config.model_type,
-               "splits": split_info, "excluded_coins": excluded,
-               "data_manifest": {coin: {"timeframes": {config.kronos_timeframe: _manifest(frames[coin])}} for coin in coins},
-               "best_epoch": best_epoch, "history": history, "metrics": metrics, "interval_note": interval_note,
-               "parameters_changed": changed, "torch_version": str(torch.__version__), "device": str(device),
-               "deterministic_algorithms": True, "kronos": kronos,
-               "training_control": {"initial_epochs": config.epochs, "epoch_limit": epoch_limit,
-                                    "extension_epochs": 10, "epochs_completed": len(history), "decisions": decisions}}
-    summary["tokenizer_training"] = tokenizer_training
+    metadata["residual_bounds"] = bounds.tolist()
+    metadata["training_complete"] = metadata["evaluation_complete"] = True
+    summary.update(best_epoch=best_epoch, metrics=metrics, parameters_changed=changed,
+                   training_complete=True, evaluation_complete=True,
+                   training_control={"initial_epochs": config.epochs, "epoch_limit": epoch_limit,
+                                     "extension_epochs": 10, "epochs_completed": len(history), "decisions": decisions})
     latest = [latest_samples[coin] for coin in coins]
     latest_prediction = forecast_samples(model, tokenizer, latest, config, device, emit)
     now = pd.Timestamp.now(tz="UTC")

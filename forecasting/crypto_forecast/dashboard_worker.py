@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+import zipfile
 
 # Windows spawn imports the launching module as __mp_main__. Preparation
 # children only need the CPU helper module, so avoid loading Torch there.
@@ -17,6 +18,54 @@ if __name__ != "__mp_main__":
     from .dashboard import publish_download, read_json, utc_now, write_json
     from .data import download_multiframe_history, refresh_multiframe_recent
     from .pipeline import TrainingConfig, train
+
+
+def _predictor_paths(job):
+    """Only inspect this job's configured predictor artifacts."""
+    config = job.get("config", {})
+    if (job.get("operation") != "train" or config.get("model_type") not in {"kronos-small", "kronos-base"}
+            or config.get("kronos_training_stage") == "tokenizer"):
+        return None
+    try:
+        directory = Path(config["run_dir"])
+        checkpoint, summary = directory / "predictor.pt", directory / "predictor_summary.json"
+        if (directory.is_symlink() or checkpoint.is_symlink() or summary.is_symlink()
+                or checkpoint.resolve().parent != directory.resolve()
+                or summary.resolve().parent != directory.resolve()
+                or not checkpoint.is_file() or checkpoint.stat().st_size == 0):
+            return None
+        return checkpoint.resolve(), summary.resolve()
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+
+
+def _saved_predictor_checkpoint(job):
+    paths = _predictor_paths(job)
+    if paths is None:
+        return None
+    checkpoint, summary_path = paths
+    try:
+        # Torch's ZIP container can be checked without loading large tensors.
+        # A newer checkpoint may have survived a failed summary publication.
+        if (not zipfile.is_zipfile(checkpoint)
+                or summary_path.stat().st_mtime_ns < checkpoint.stat().st_mtime_ns):
+            return None
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (not isinstance(summary, dict) or summary.get("artifact_type") != "kronos-predictor"
+                or type(summary.get("training_complete")) is not bool
+                or summary.get("evaluation_complete") is not False
+                or type(summary.get("best_epoch")) is not int or summary["best_epoch"] < 1
+                or not isinstance(summary.get("config"), dict)
+                or Path(summary["config"]["run_dir"]).resolve() != checkpoint.parent
+                or not isinstance(summary.get("history"), list)
+                or not any(isinstance(row, dict) and row.get("epoch") == summary["best_epoch"]
+                           for row in summary["history"])):
+            return None
+        return {"checkpoint_path": str(checkpoint), "summary_path": str(summary_path),
+                "best_epoch": summary["best_epoch"], "training_complete": summary["training_complete"],
+                "evaluation_complete": False}
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 def run_job(path, commands=None):
@@ -36,6 +85,13 @@ def run_job(path, commands=None):
         print(message, flush=True)
 
     def event(value):
+        checkpoint = None
+        if value["kind"] == "checkpoint":
+            checkpoint = _saved_predictor_checkpoint(job)
+            if checkpoint is None or value.get("checkpoint_path") != checkpoint["checkpoint_path"]:
+                return
+            # Use the saved summary rather than callback paths or state flags.
+            value = {"kind": "checkpoint", **checkpoint}
         with lock:
             job["stage"] = value.get("stage", job["stage"])
             job["progress"].update({k: v for k, v in value.items() if k not in {"kind", "stage"}})
@@ -48,7 +104,11 @@ def run_job(path, commands=None):
             elif value["kind"] == "tokenizer_epoch":
                 job.setdefault("tokenizer_history", []).append(
                     {k: value[k] for k in ("epoch", "train_loss", "validation_loss", "learning_rate", "lr_end", "lr_next") if k in value})
+            elif checkpoint is not None:
+                job["saved_checkpoint"] = checkpoint
             save()
+        if checkpoint is not None:
+            log(f"Saved best predictor checkpoint from epoch {checkpoint['best_epoch']} to {checkpoint['checkpoint_path']}.")
 
     last_download_save = 0.0
 
@@ -208,6 +268,21 @@ def run_job(path, commands=None):
                     row.update(status="failed", error=str(error))
         job.update(status="failed", stage="failed", pending_decision=None, error=str(error), finished_at=utc_now())
         log(f"Job failed: {error}")
+        checkpoint = _saved_predictor_checkpoint(job)
+        if checkpoint is not None:
+            job["saved_checkpoint"] = checkpoint
+            state = "Training completed" if checkpoint["training_complete"] else "Training interrupted"
+            log(f"{state}; best predictor weights from epoch {checkpoint['best_epoch']} are saved at "
+                f"{checkpoint['checkpoint_path']}. Held-out evaluation is not complete. "
+                "The saved checkpoint remains available for recovery.")
+        else:
+            job.pop("saved_checkpoint", None)
+            paths = _predictor_paths(job)
+            if paths is not None:
+                log(f"Predictor weights exist at {paths[0]}, but checkpoint recovery metadata could not be verified. "
+                    "Held-out evaluation is not complete.")
+            else:
+                save()
         return 1
 
 

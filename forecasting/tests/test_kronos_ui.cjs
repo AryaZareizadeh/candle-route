@@ -31,7 +31,8 @@ const context = vm.createContext({
     createElement: (tag) => field("new-" + tag) },
   localStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
   Option: function(text, value) { this.text = text; this.value = value; },
-  console, setTimeout, clearTimeout,
+  console, AbortController, setTimeout: () => 1, clearTimeout() {},
+  fetch: (...args) => context.fetchResponse(...args),
 });
 let source = fs.readFileSync(path.join(__dirname, "../crypto_forecast/web/app.js"), "utf8");
 source = source.slice(0, source.indexOf('  $("training-form").addEventListener("submit"'));
@@ -40,7 +41,9 @@ source += `
   renderLogs = () => {};
   globalThis.ui = { state, applyDefaults, changeModel, syncModelControls, syncSchedulers,
     useTokenizerSettings, configFromForm, saveFormSettings, restoreFormSettings,
-    applyTokenizerBootstrap, renderMonitor, setCoinSelection, organizeCoinChoices, downloadCoinView };
+    applyTokenizerBootstrap, renderMonitor, setCoinSelection, organizeCoinChoices, downloadCoinView,
+    initialize, poll, renderJobs,
+    disableArchitecturePreview() { renderArchitecture = () => {}; } };
 })();`;
 vm.runInContext(source, context);
 const ui = context.ui;
@@ -164,4 +167,38 @@ assert.equal(ui.downloadCoinView(downloading, "BTC").status, "Saved");
 assert.equal(ui.downloadCoinView(downloading, "BTC").percent, 100);
 downloading.status = "stopped";
 assert.equal(ui.downloadCoinView(downloading, "BTC").status, "Saved");
-console.log("Kronos UI smoke passed: stages, batches, schedulers, reuse, persistence, compatibility, completed curves.");
+async function checkTrainingWorkspace() {
+  ui.disableArchitecturePreview();
+  const completed = { id: "completed-predictor", name: "Predictor training", operation: "train",
+    status: "completed", stage: "completed", config: { model_type: "kronos-small", coins: ["BTC"],
+      kronos_training_stage: "predictor", epochs: 5 }, history, progress: { best_epoch: 1 } };
+  const bootstrap = { csrf_token: "test-token", defaults: {}, jobs: [completed], tokenizers: [], data: { coins: [] } };
+  const requests = [];
+  let jobs = [completed];
+  context.fetchResponse = async (url) => {
+    requests.push(url);
+    const value = url === "/api/bootstrap" ? bootstrap : url === "/api/jobs" ? { jobs } :
+      url === "/api/tokenizers" ? { tokenizers: [{ id: "new-tokenizer", config: {} }] } : null;
+    assert.ok(value, `Unexpected workspace request: ${url}`);
+    return { ok: true, json: async () => value };
+  };
+  field("monitor-component").value = "auto";
+  await ui.initialize();
+  assert.equal(ui.state.selectedJob, completed.id, "Completed training remains visible on opening the workspace");
+  assert.equal(ui.state.testChartHistory, history);
+  assert.equal(field("status-badge").textContent, "Completed");
+  assert.equal(field("page-error").textContent, "");
+
+  const running = { ...completed, id: "current-tokenizer", status: "running",
+    config: { ...completed.config, kronos_training_stage: "tokenizer" } };
+  bootstrap.jobs = [completed, running];
+  await ui.initialize();
+  assert.equal(ui.state.selectedJob, running.id, "Active training takes priority over completed jobs");
+  jobs = [completed, { ...running, status: "completed" }];
+  await ui.poll();
+  assert.equal(ui.state.tokenizers[0].id, "new-tokenizer", "Finished tokenizer becomes available for predictor tuning");
+  assert.equal(ui.state.online, true);
+  assert.ok(!requests.some((url) => url.startsWith("/api/runs")));
+  console.log("Kronos UI smoke passed: stages, batches, schedulers, reuse, persistence, compatibility, completed curves, workspace initialization and polling.");
+}
+checkTrainingWorkspace().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -10,18 +10,13 @@
     if (hours < 24) return `${number(hours, 2)} ${hours === 1 ? "hour" : "hours"}`;
     return `${number(days, 2)} ${days === 1 ? "day" : "days"}`;
   }
-  function horizonLabel(row) {
-    const duration = durationLabel(Number(row.horizon_days));
-    return row.horizon_candles == null ? duration : `${row.horizon_candles} ${row.timeframe} ${row.horizon_candles === 1 ? "candle" : "candles"} · ${duration}`;
-  }
-  const state = { token: null, models: [], jobs: [], runs: [], tokenizers: [], separateStagesSupported: false, selectedJob: null, selectedRun: null, run: null, horizon: 1, busy: false, timer: null, online: false, logSignature: "", pollCount: 0, runLoading: false, submittedDecision: null, seenDecisions: new Set() };
+  const state = { token: null, models: [], jobs: [], tokenizers: [], savedRuns: [], savedRunsSupported: false, removingRun: null, separateStagesSupported: false, selectedJob: null, busy: false, timer: null, online: false, logSignature: "", pollCount: 0, submittedDecision: null, seenDecisions: new Set() };
   const active = (job) => job && ["queued", "running", "awaiting_decision"].includes(job.status);
   const waiting = (job) => job?.status === "awaiting_decision" && Boolean(job.pending_decision);
   const decisionKey = (job) => waiting(job) ? `${job.id}:${job.pending_decision.decision_id}` : null;
   const number = (value, digits = 2) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
   const count = (value) => number(value, 0);
   const ordinal = (value) => { const n = Number(value); return Number.isInteger(n) ? `${n}${n % 100 >= 10 && n % 100 <= 20 ? "th" : { 1: "st", 2: "nd", 3: "rd" }[n % 10] || "th"}` : "—"; };
-  const price = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toLocaleString(undefined, { maximumSignificantDigits: 8 });
   const percent = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : `${number(Number(value) * 100, 1)}%`;
   const date = (value, detailed = false) => {
     if (!value) return "—";
@@ -154,7 +149,7 @@
     saveCoinChoices(); renderArchitecture();
   }
   function discoverCoinChoices(bootstrap) {
-    const coins = [ ...(bootstrap.data?.coins || []).map((entry) => entry.coin), ...(bootstrap.jobs || []).flatMap((job) => job.config?.coins || []), ...(bootstrap.runs || []).flatMap((run) => run.coins || []) ];
+    const coins = [ ...(bootstrap.data?.coins || []).map((entry) => entry.coin), ...(bootstrap.jobs || []).flatMap((job) => job.config?.coins || []) ];
     for (const coin of coins) coinChoice(coin);
     organizeCoinChoices();
   }
@@ -370,11 +365,47 @@
     } catch (error) { showError("job-error", error.message); }
     finally { state.busy = false; updateActions(); schedulePoll(600); }
   }
+  function renderSavedRuns(runs = state.savedRuns) {
+    state.savedRuns = runs;
+    const list = $("saved-run-list"); list.replaceChildren();
+    if (!runs.length) { list.append(node("p", "No saved training runs yet.", "empty-small")); return; }
+    for (const run of runs) {
+      const row = node("div", null, "saved-run-row"), details = node("div");
+      details.append(node("strong", run.name || run.id));
+      const artifacts = run.artifacts || [];
+      const evaluated = artifacts.includes("model.pt") && artifacts.includes("summary.json") && ["completed", "saved"].includes(run.status || "saved");
+      const kind = evaluated ? "Model and evaluation" : artifacts.includes("predictor.pt") ? "Predictor weights · evaluation incomplete" : artifacts.includes("model.pt") ? "Saved model files" : artifacts.includes("tokenizer.pt") ? "Tokenizer" : "Partial training files";
+      details.append(node("p", `${kind} · ${run.status || "saved"}${run.created_at ? " · " + date(run.created_at) : ""}`));
+      const button = node("button", "Remove", "button stop remove-saved-run");
+      button.type = "button"; button.disabled = run.removable === false || Boolean(state.removingRun);
+      button.setAttribute("aria-label", `Remove saved run ${run.name || run.id}`);
+      if (run.removable === false) button.title = "Stop the active job before removing this run.";
+      button.addEventListener("click", () => removeSavedRun(run.id));
+      row.append(details, button); list.append(row);
+    }
+  }
+  async function removeSavedRun(identifier) {
+    const run = state.savedRuns.find((item) => item.id === identifier);
+    if (!run || run.removable === false || state.removingRun) return;
+    if (!window.confirm(`Remove "${run.name || run.id}"?\n\nThis permanently deletes this run's saved model, tokenizer, predictions, and reports. Its job history will remain. Original pretrained models and candle data are kept.`)) return;
+    state.removingRun = identifier; showError("saved-runs-error", ""); $("saved-runs-feedback").textContent = "Removing saved files…"; renderSavedRuns();
+    try {
+      await api(`/api/runs/${encodeURIComponent(identifier)}/delete`, { method: "POST", body: "{}" });
+      state.savedRuns = state.savedRuns.filter((item) => item.id !== identifier);
+      const bootstrap = await api("/api/bootstrap");
+      state.jobs = bootstrap.jobs || []; state.savedRuns = bootstrap.saved_runs || state.savedRuns;
+      if ($("kronos_tokenizer_run_id").value === identifier) { $("kronos_tokenizer_run_id").value = ""; restoredTokenizerId = ""; }
+      applyTokenizerBootstrap(bootstrap); renderJobs(); renderMonitor(); saveFormSettings();
+      if (window.modelWorkspace?.refresh) await window.modelWorkspace.refresh();
+      $("saved-runs-feedback").textContent = "Saved files removed. Job history is still available.";
+    } catch (error) { showError("saved-runs-error", error.message); $("saved-runs-feedback").textContent = ""; }
+    finally { state.removingRun = null; renderSavedRuns(); schedulePoll(600); }
+  }
   function renderJobs() {
     const select = $("job-select"); select.replaceChildren();
     const jobs = state.jobs.filter((job) => job.operation !== "forecast");
-    select.append(new Option(jobs.length ? "Saved experiment view" : "No training jobs", ""));
-    for (const job of jobs) select.append(new Option(`${job.name || (job.operation === "download" ? "Candle download" : "Training run")} · ${job.status === "awaiting_decision" ? "waiting for your choice" : job.status}`, job.id));
+    select.append(new Option(jobs.length ? "Choose a job" : "No training jobs", ""));
+    for (const job of jobs) select.append(new Option(`${job.name || (job.operation === "download" ? "Candle download" : "Training run")} · ${job.status === "awaiting_decision" ? "waiting for your choice" : job.status}${job.artifacts_removed_at ? " · saved files removed" : ""}`, job.id));
     select.value = state.selectedJob || "";
     updateActions();
   }
@@ -643,17 +674,18 @@
     }
   }
   function renderMonitor() {
-    const job = state.jobs.find((item) => item.id === state.selectedJob), summary = !job ? state.run?.summary : null;
+    const job = state.jobs.find((item) => item.id === state.selectedJob);
     renderDownloadCoins(job);
     const tokenizerOnly = job?.config?.kronos_training_stage === "tokenizer";
     const tokenizerStage = job?.stage === "training_tokenizer" || tokenizerOnly;
     const tokenizerCurve = $("monitor-component").value === "tokenizer" || ($("monitor-component").value === "auto" && tokenizerStage);
-    const monitorHistory = tokenizerStage ? job?.tokenizer_history || [] : job?.history || summary?.history || [];
-    const progress = job?.progress || {}, history = tokenizerCurve ? job?.tokenizer_history || summary?.tokenizer_training?.history || [] : job?.history || summary?.history || [], counts = progress.counts || summary?.splits?.counts || {};
-    const status = job?.status || (summary ? "completed" : "idle");
+    const monitorHistory = tokenizerStage ? job?.tokenizer_history || [] : job?.history || [];
+    const progress = job?.progress || {}, history = tokenizerCurve ? job?.tokenizer_history || [] : job?.history || [], counts = progress.counts || {};
+    const status = job?.status || "idle";
     $("status-badge").className = `status-badge ${status}`;
     $("status-badge").textContent = ({ idle: "Ready", queued: "Queued", running: "Running", awaiting_decision: "Waiting for you", completed: "Completed", failed: "Failed", stopped: "Stopped", interrupted: "Interrupted" })[status] || status;
-    $("monitor-caption").textContent = job ? `${job.name || (job.operation === "download" ? "Candle download" : "Training run")} · ${(job.config?.coins || []).join(", ")}` : summary ? `${state.run.name} · ${date(summary.created_at)}` : "Your learning curve will appear here.";
+    $("monitor-caption").textContent = job ? `${job.name || (job.operation === "download" ? "Candle download" : "Training run")} · ${(job.config?.coins || []).join(", ")}` : "Your learning curve will appear here.";
+    if (job?.artifacts_removed_at) $("monitor-caption").textContent += " · saved files removed; history retained";
     const stages = { starting: "Starting job", loading: "Loading candles", preparing: "Preparing samples", training: "Training model", awaiting_decision: "Waiting for your choice", evaluating: "Evaluating model", saving: "Saving results", downloading: "Downloading candles", publishing: "Saving candles", publishing_coin: "Saving coin candles", completed: "Completed", stopped: "Stopped", interrupted: "Interrupted", failed: "Run failed" };
     stages.training_tokenizer = "Fine-tuning tokenizer";
     stages.loading_model = "Loading pretrained model";
@@ -661,11 +693,11 @@
     if (job?.stage === "preparing" && preparationLabels[progress.preparation_phase]) stages.preparing = preparationLabels[progress.preparation_phase];
     if (["kronos-small", "kronos-base"].includes(job?.config?.model_type)) stages.training = "Fine-tuning predictor";
     if (tokenizerCurve) $("monitor-caption").textContent += " · tokenizer: reconstruction + BSQ training loss; full reconstruction validation MSE";
-    $("stage-value").textContent = stages[job?.stage] || job?.stage || (summary ? "Saved experiment" : "Waiting for a run");
+    $("stage-value").textContent = stages[job?.stage] || job?.stage || "Waiting for a run";
     const epoch = progress.epoch || monitorHistory.at(-1)?.epoch;
-    const maxEpochs = progress.max_epochs || (tokenizerStage ? job?.config?.kronos_tokenizer_epochs : job?.config?.epochs) || summary?.training_control?.epoch_limit || summary?.config?.epochs;
+    const maxEpochs = progress.max_epochs || (tokenizerStage ? job?.config?.kronos_tokenizer_epochs : job?.config?.epochs);
     $("epoch-value").textContent = epoch ? `${epoch}${maxEpochs ? ` / ${maxEpochs}` : ""}` : "—";
-    const bestEpoch = progress.best_epoch || summary?.best_epoch;
+    const bestEpoch = progress.best_epoch;
     const bestLoss = progress.best_validation_loss ?? monitorHistory.find((row) => row.epoch === bestEpoch)?.validation_loss;
     $("best-value").textContent = bestLoss != null ? number(bestLoss, 4) : "—";
     $("best-value").title = bestEpoch ? `Selected epoch ${bestEpoch}` : "";
@@ -678,7 +710,7 @@
     $("progress-track").setAttribute("aria-label", hasPreparation ? stages.preparing : "Current stage progress");
     $("progress-track").classList.toggle("indeterminate", Boolean(active(job) && !waiting(job) && !hasPreparation && !hasBatches && !hasCoins));
     $("progress-percent").textContent = hasPreparation || hasBatches || hasCoins ? `${Math.round(ratio)}%` : "";
-    $("progress-text").textContent = active(job) ? hasBatches ? `Batch ${count(progress.batch || 0)} of ${count(progress.total_batches)}${progress.train_loss != null ? ` · training loss ${number(progress.train_loss, 4)}` : ""}` : hasCoins ? `${count(progress.completed_coins || 0)} of ${count(progress.total_coins)} coins saved${progress.coin ? ` · downloading ${progress.coin}` : ""}` : job.operation === "download" ? "Downloading and verifying historical candles…" : "Preparing candles and training samples…" : job ? job.status === "completed" ? job.operation === "download" ? "Candles saved. You can now train a model." : "Training finished. The best validation epoch was saved." : job.status === "failed" ? "This run ended with an error. See the activity log." : "This job has stopped." : summary ? `Best epoch ${summary.best_epoch || "—"} selected from ${history.length} completed epochs.` : "Choose your coins and start training.";
+    $("progress-text").textContent = active(job) ? hasBatches ? `Batch ${count(progress.batch || 0)} of ${count(progress.total_batches)}${progress.train_loss != null ? ` · training loss ${number(progress.train_loss, 4)}` : ""}` : hasCoins ? `${count(progress.completed_coins || 0)} of ${count(progress.total_coins)} coins saved${progress.coin ? ` · downloading ${progress.coin}` : ""}` : job.operation === "download" ? "Downloading and verifying historical candles…" : "Preparing candles and training samples…" : job ? job.status === "completed" ? job.operation === "download" ? "Candles saved. You can now train a model." : "Training finished. The best validation epoch was saved." : job.status === "failed" ? "This run ended with an error. See the activity log." : "This job has stopped." : "Choose your coins and start training.";
     if (active(job) && job.stage === "preparing" && preparationLabels[progress.preparation_phase]) {
       $("progress-text").textContent = hasPreparation ? progress.preparation_phase === "windows" ? `${count(progress.preparation_completed || 0)} of ${count(progress.preparation_total)} candle windows checked${progress.coin ? ` · ${progress.coin}` : ""} · ${count(progress.usable_samples || 0)} usable examples` : `${stages.preparing}: ${count(progress.preparation_completed || 0)} of ${count(progress.preparation_total)}` : `${stages.preparing}…`;
     }
@@ -691,88 +723,12 @@
     if (active(job) && job.stage === "publishing") $("progress-text").textContent = "Saving verified candle data to the local data folder…";
     if (waiting(job)) $("progress-text").textContent = "Training is paused until you choose to continue or finish.";
     $("train-count").textContent = count(counts.train); $("validation-count").textContent = count(counts.validation); $("test-count").textContent = count(counts.test);
-    $("device-value").textContent = progress.device || summary?.device || summary?.config?.device || "—";
+    $("device-value").textContent = progress.device || job?.config?.device || "—";
     showError("job-error", job?.error ? typeof job.error === "string" ? job.error : job.error.message || JSON.stringify(job.error) : "");
     $("curve-component-note").textContent = tokenizerCurve ? "Tokenizer: reconstruction + BSQ training loss; full reconstruction validation MSE." : "Model / predictor training and validation losses.";
     const liveRate = tokenizerCurve === tokenizerStage ? progress.learning_rate : null;
     $("learning-rate-value").textContent = rateText(liveRate ?? history.at(-1)?.lr_end ?? history.at(-1)?.learning_rate);
-    renderDecision(job); renderChart(history); renderChart(history, true); renderLogs(job?.logs || [], summary ? "This saved experiment has no live job log. Open its full report for the complete evaluation." : undefined); updateActions();
-  }
-  function renderRuns() {
-    const container = $("runs-list"); container.replaceChildren();
-    $("run-empty").hidden = state.runs.length > 0;
-    if (!state.runs.length) { $("run-detail").hidden = true; return; }
-    for (const run of state.runs) {
-      const button = node("button", null, `run-item${run.id === state.selectedRun ? " selected" : ""}`); button.type = "button";
-      button.setAttribute("aria-pressed", String(run.id === state.selectedRun));
-      button.append(node("strong", run.name || run.id), node("span", (run.coins || []).join(", "), "run-coins"), node("span", `${(run.model_type || "gru").toUpperCase()} · ${date(run.created_at)}${run.best_epoch ? ` · best epoch ${run.best_epoch}` : ""}${run.data_kind?.includes("synthetic") ? " · synthetic" : ""}`));
-      button.addEventListener("click", () => loadRun(run.id, true)); container.append(button);
-    }
-  }
-  async function loadRun(id, focusMonitor = false) {
-    state.selectedRun = id; if (focusMonitor) { state.selectedJob = null; renderJobs(); } renderRuns();
-    state.runLoading = true; $("run-detail").hidden = true;
-    try {
-      const run = await api(`/api/runs/${encodeURIComponent(id)}`);
-      if (state.selectedRun !== id) return;
-      state.run = run; renderRunDetail(); if (!state.selectedJob) renderMonitor();
-      showError("page-error", "");
-    } catch (error) { if (state.selectedRun === id) showError("page-error", `Could not open this saved experiment: ${error.message}`); }
-    finally { state.runLoading = false; }
-  }
-  function renderRunDetail() {
-    if (!state.run) return;
-    const { summary } = state.run;
-    $("run-detail").hidden = false; $("run-title").textContent = state.run.name || state.run.id;
-    const modelType = summary.model_type || summary.config?.model_type || "gru";
-    const mode = ["kronos-small", "kronos-base"].includes(modelType) ? `${summary.kronos?.timeframe || summary.config?.kronos_timeframe || "4h"} candles · ${summary.kronos?.tokenizer_finetuned ? "fine-tuned tokenizer" : "frozen pretrained tokenizer"}` : summary.config?.input_mode === "multiframe" ? "15m / 1h / 4h / 1d" : "Daily candles";
-    $("run-meta").textContent = `${["kronos-small", "kronos-base"].includes(modelType) ? modelType.replace("kronos", "Kronos") : modelType.toUpperCase()} · ${mode} · ${(summary.coins || []).join(", ")} · ${date(summary.created_at, true)} UTC`;
-    $("evaluation-note").textContent = "The best epoch is selected using validation data, then evaluated on the final test. All-coins rows average each coin equally." + (["kronos-small", "kronos-base"].includes(modelType) ? ` Evaluation uses every ${ordinal(summary.kronos?.eval_stride || summary.config?.kronos_eval_stride || 1)} eligible held-out origin per coin. Baselines use those same sampled origins. A local test split does not establish that these dates were absent from Kronos pretraining.` : "");
-    const reportURL = state.run.report_url;
-    $("report-link").hidden = !reportURL || !reportURL.startsWith("/runs/");
-    $("report-link").href = reportURL?.startsWith("/runs/") ? reportURL : "#";
-    $("synthetic-note").hidden = !String(summary.data_kind || "").includes("synthetic");
-    const excluded = Object.entries(summary.excluded_coins || {});
-    $("exclusions-note").hidden = !excluded.length;
-    $("exclusions-note").textContent = excluded.length ? `Excluded coins: ${excluded.map(([coin, reason]) => `${coin}: ${typeof reason === "string" ? reason : JSON.stringify(reason)}`).join("; ")}` : "";
-    const selection = $("metric-coin").value, coins = [...new Set((summary.coins || []).concat(...Object.values(summary.metrics || {}).map((rows) => Array.isArray(rows) ? rows.map((row) => row.coin).filter((coin) => coin && coin !== "ALL") : [])))];
-    $("metric-coin").replaceChildren(new Option("All coins", "ALL"));
-    coins.forEach((coin) => $("metric-coin").append(new Option(coin, coin)));
-    if (coins.includes(selection)) $("metric-coin").value = selection;
-    const horizons = [...new Map((state.run.forecasts || []).map((row) => [Number(row.horizon_days), row])).values()];
-    if (!horizons.some((row) => Number(row.horizon_days) === state.horizon)) state.horizon = Number(horizons.at(-1)?.horizon_days || 1);
-    $("forecast-horizon").replaceChildren(...horizons.map((row) => new Option(horizonLabel(row), String(row.horizon_days))));
-    $("forecast-horizon").value = String(state.horizon);
-    renderForecasts(); renderMetrics();
-  }
-  function emptyRow(body, columns, message) { const row = node("tr"), cell = node("td", message, "empty-small"); cell.colSpan = columns; cell.style.textAlign = "left"; row.append(cell); body.append(row); }
-  function renderForecasts() {
-    const body = $("forecast-body"); body.replaceChildren();
-    const rows = (state.run?.forecasts || []).filter((row) => Number(row.horizon_days) === state.horizon);
-    if (!rows.length) { emptyRow(body, 6, "No forecasts are available for this run."); $("forecast-note").textContent = ""; return; }
-    const origins = [...new Set(rows.map((row) => row.as_of))];
-    $("forecast-note").textContent = origins.length === 1 ? `As of ${date(origins[0], true)} UTC · target ${date(rows[0].target_date, true)} UTC` : "Each forecast uses its coin’s latest complete candle history. Dates are available in the full report.";
-    for (const row of rows) {
-      const tr = node("tr"), change = row.change_pct;
-      const values = [row.coin, price(row.last_price_usdt), price(row.forecast_price_usdt), change == null ? "—" : `${Number(change) > 0 ? "+" : ""}${number(change)}%`, `${price(row.lower_price_usdt)} – ${price(row.upper_price_usdt)}`, row.is_stale ? "Historical / stale" : "Fresh at creation"];
-      values.forEach((value, index) => tr.append(node("td", value, index === 3 && change != null ? Number(change) >= 0 ? "positive" : "negative" : index === 5 && row.is_stale ? "stale-label" : "")));
-      body.append(tr);
-    }
-  }
-  function renderMetrics() {
-    const body = $("metric-body"); body.replaceChildren();
-    const rows = (state.run?.summary?.metrics?.[$("metric-split").value] || []).filter((row) => row.coin === $("metric-coin").value);
-    if (!rows.length) { emptyRow(body, 6, "No evaluation rows are available for this selection."); return; }
-    const modelName = { gru: "GRU forecast", lstm: "LSTM forecast", "kronos-small": "Kronos-small forecast", "kronos-base": "Kronos-base forecast", persistence: "Unchanged price", drift: "Trailing drift" };
-    for (const row of rows) {
-      const tr = node("tr", null, ["gru", "lstm", "kronos-small", "kronos-base"].includes(row.model) ? "model-row" : "");
-      [horizonLabel(row), modelName[row.model] || row.model, number(row.return_mae_pct), number(row.return_rmse_pct), percent(row.direction_accuracy), count(row.samples)].forEach((value) => tr.append(node("td", value))); body.append(tr);
-    }
-  }
-  async function refreshRuns(chooseLatest = false) {
-    const [response, tokenizerResponse] = await Promise.all([api("/api/runs"), state.separateStagesSupported ? api("/api/tokenizers") : Promise.resolve(null)]);
-    state.runs = response.runs || []; renderRuns(); if (tokenizerResponse) renderTokenizers(tokenizerResponse.tokenizers || []);
-    if (state.runs.length && (!state.selectedRun || chooseLatest)) await loadRun(state.runs[0].id);
+    renderDecision(job); renderChart(history); renderChart(history, true); renderLogs(job?.logs || []); updateActions();
   }
   function schedulePoll(delay) { clearTimeout(state.timer); state.timer = setTimeout(poll, delay); }
   async function poll() {
@@ -780,15 +736,15 @@
       if (!state.online && state.token) {
         const recovered = await api("/api/bootstrap");
         state.token = recovered.csrf_token; applyModelOptions(recovered.models); applyTokenizerBootstrap(recovered); renderCoverage(recovered.data); discoverCoinChoices(recovered); renderArchitecture();
+        state.savedRunsSupported = Array.isArray(recovered.saved_runs); renderSavedRuns(recovered.saved_runs || []);
       }
       if (!state.token) {
         const bootstrap = await api("/api/bootstrap");
         state.token = bootstrap.csrf_token; applyModelOptions(bootstrap.models); applyDefaults(bootstrap.defaults); restoreFormSettings(); applyTokenizerBootstrap(bootstrap); restoreCoinChoices(bootstrap); renderCoverage(bootstrap.data); renderArchitecture();
-        state.jobs = bootstrap.jobs || []; state.runs = bootstrap.runs || [];
-        state.selectedJob = state.jobs.find((job) => job.operation !== "forecast" && active(job))?.id || null;
+        state.jobs = bootstrap.jobs || [];
+        state.savedRunsSupported = Array.isArray(bootstrap.saved_runs); renderSavedRuns(bootstrap.saved_runs || []);
+        state.selectedJob = state.jobs.find((job) => job.operation !== "forecast" && active(job))?.id || state.jobs.find((job) => job.operation !== "forecast")?.id || null;
         selectPendingDecision(true);
-        renderRuns();
-        if (state.runs.length && !state.run) await loadRun(state.runs[0].id);
       }
       const previous = state.jobs, response = await api("/api/jobs");
       state.jobs = response.jobs || [];
@@ -796,7 +752,8 @@
       renderJobs(); renderMonitor(); connection(true); showError("page-error", "");
       const justFinished = state.jobs.find((job) => ["completed", "failed", "stopped", "interrupted"].includes(job.status) && active(previous.find((old) => old.id === job.id)));
       if (justFinished || ++state.pollCount % 20 === 0) {
-        await refreshRuns(Boolean(justFinished?.status === "completed" && justFinished?.run_id && justFinished?.config?.kronos_training_stage !== "tokenizer"));
+        if (state.separateStagesSupported) { const response = await api("/api/tokenizers"); renderTokenizers(response.tokenizers || []); }
+        if (state.savedRunsSupported) { const saved = await api("/api/saved-runs"); renderSavedRuns(saved.saved_runs || []); }
         if (justFinished?.operation === "download") { const fresh = await api("/api/bootstrap"); renderCoverage(fresh.data); discoverCoinChoices(fresh); renderArchitecture(); }
       }
     } catch (error) { connection(false); showError("page-error", `Unable to reach the local server. Keep the dashboard server running. ${error.message}`); }
@@ -807,11 +764,11 @@
     try {
       const bootstrap = await api("/api/bootstrap"); state.token = bootstrap.csrf_token; applyModelOptions(bootstrap.models); applyDefaults(bootstrap.defaults); restoreFormSettings(); applyTokenizerBootstrap(bootstrap); restoreCoinChoices(bootstrap); renderCoverage(bootstrap.data); renderArchitecture();
       $("hardware-note").textContent = bootstrap.hardware?.cuda_available === true ? "CUDA GPU available. Automatic will use the GPU." : bootstrap.hardware?.cuda_available === false ? "CPU training available. No CUDA GPU was detected." : "Automatic checks GPU availability when training starts.";
-      state.jobs = bootstrap.jobs || []; state.runs = bootstrap.runs || [];
-      state.selectedJob = state.jobs.find((job) => job.operation !== "forecast" && active(job))?.id || null;
+      state.jobs = bootstrap.jobs || [];
+      state.savedRunsSupported = Array.isArray(bootstrap.saved_runs); renderSavedRuns(bootstrap.saved_runs || []);
+      state.selectedJob = state.jobs.find((job) => job.operation !== "forecast" && active(job))?.id || state.jobs.find((job) => job.operation !== "forecast")?.id || null;
       selectPendingDecision(true);
-      connection(true); renderJobs(); renderRuns(); renderMonitor();
-      if (state.runs.length) await loadRun(state.runs[0].id);
+      connection(true); renderJobs(); renderMonitor();
     } catch (error) { connection(false); showError("page-error", `Could not load the training workspace. ${error.message}`); }
     finally { schedulePoll(1500); }
   }
@@ -849,10 +806,5 @@
   $("continue-training").addEventListener("click", () => decideTraining("continue"));
   $("finish-training").addEventListener("click", () => decideTraining("finish"));
   $("job-select").addEventListener("change", (event) => { state.selectedJob = event.target.value || null; state.logSignature = ""; renderMonitor(); });
-  $("refresh-runs").addEventListener("click", async () => { $("refresh-runs").disabled = true; try { await refreshRuns(); } catch (error) { showError("page-error", error.message); } finally { $("refresh-runs").disabled = false; } });
-  $("metric-split").addEventListener("change", renderMetrics); $("metric-coin").addEventListener("change", renderMetrics);
-  $("forecast-horizon").addEventListener("change", () => {
-    state.horizon = Number($("forecast-horizon").value); renderForecasts();
-  });
   initialize();
 })();

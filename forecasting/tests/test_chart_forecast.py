@@ -105,7 +105,7 @@ def test_forecast_job_worker_persists_results_without_training(tmp_path, monkeyp
     try:
         job = manager.start_chart_forecast({**payload(), "device": "cpu"})
         assert job["operation"] == "forecast" and "csv" not in job["config"]
-        assert launches and job["run_id"] is None
+        assert launches
         with pytest.raises(DashboardError, match="not available"):
             manager.chart_result(job["id"])
         with pytest.raises(DashboardError, match="already running"):
@@ -132,13 +132,12 @@ def test_saved_finetuned_chart_inference_is_separate_and_checks_interval(tmp_pat
                             "model_config": model_config, "tokenizer_config": tokenizer_config},
                 "state_dict": model.state_dict(), "tokenizer_state_dict": tokenizer.state_dict()}, run / "model.pt")
     (run / "summary.json").write_text(json.dumps({"model_type": "kronos-small", "config": {"kronos_timeframe": "1d"}}))
-    (run / "forecasts.json").write_text("[]")
     before = {**hashes(original), "fine-tuned": hashes(run)["model.pt"]}
     manager = JobManager(tmp_path)
     monkeypatch.setattr(manager, "_launch", lambda _: None)
     try:
         assert manager.chart_models()["original_ready"]
-        assert manager.chart_models()["runs"][0]["id"] == "my-finetune"
+        assert [run["id"] for run in manager.chart_models()["runs"]] == ["my-finetune"]
         with pytest.raises(DashboardError, match="trained on this candle interval"):
             manager.start_chart_forecast({**payload(), "model": "my-finetune", "timeframe": "4h",
                                           "csv": candles(12, "4h").to_csv(index=False)})

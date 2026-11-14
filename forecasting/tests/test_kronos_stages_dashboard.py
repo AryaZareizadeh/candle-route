@@ -45,7 +45,7 @@ def test_tokenizer_inventory_includes_stopped_combined_checkpoint(manager):
     assert items[0]["complete"] is True
     assert items[0]["best_epoch"] == 2
     assert items[0]["best_validation_loss"] == 0.3
-    assert manager.list_runs() == []
+    assert manager.chart_models()["runs"] == []
 
 
 def test_incomplete_tokenizer_checkpoint_remains_labeled(manager):

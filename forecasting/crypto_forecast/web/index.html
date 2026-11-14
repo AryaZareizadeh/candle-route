@@ -195,20 +195,12 @@
           <div id="job-error" class="notice error job-error" role="alert" hidden></div>
           <details class="activity" open><summary>Activity log <span id="log-count"></span></summary><div id="activity-log" class="activity-log" role="log" aria-label="Training activity" aria-live="off"><p class="empty-small">Download and training messages will appear here.</p></div></details>
         </section>
-        <section class="results-panel panel" aria-labelledby="results-title">
-          <div class="section-heading"><div><h2 id="results-title">Saved experiments</h2><p class="section-caption">Compare forecasts with held-out performance.</p></div><button id="refresh-runs" class="text-button" type="button">Refresh</button></div>
-          <div id="runs-list" class="runs-list"><p class="empty-small">Loading saved runs…</p></div>
-          <div id="run-empty" class="result-empty" hidden><p>No saved experiments yet. A completed training run will save its forecasts, learning curve, and evaluation here.</p></div>
-          <div id="run-detail" hidden>
-            <div class="run-detail-header"><div><h3 id="run-title"></h3><p id="run-meta" class="section-caption"></p></div><a id="report-link" class="button report-link" href="#" target="_blank" rel="noopener">Open full report</a></div>
-            <div id="synthetic-note" class="notice" hidden>This run uses synthetic demonstration data. Its results do not measure real cryptocurrency performance.</div>
-            <div id="exclusions-note" class="notice" hidden></div>
-            <div class="table-section-heading"><h3>Price forecasts <span class="units">USDT</span></h3><label>Forecast horizon <select id="forecast-horizon" aria-label="Forecast horizon"></select></label></div>
-            <p id="forecast-note" class="table-note"></p><div class="table-scroll"><table class="forecast-table"><thead><tr><th scope="col">Coin</th><th scope="col">Last close</th><th scope="col">Forecast</th><th scope="col">Change</th><th scope="col">Empirical 80% range</th><th scope="col">Data status</th></tr></thead><tbody id="forecast-body"></tbody></table></div>
-            <div class="table-section-heading evaluation-heading"><div><h3>Model evaluation</h3><p class="table-note">Return error in percentage points. Lower is better.</p></div><div class="evaluation-filters"><label class="sr-only" for="metric-split">Evaluation split</label><select id="metric-split"><option value="test">Final test</option><option value="validation">Validation</option><option value="test_non_overlapping">Non-overlapping test</option></select><label class="sr-only" for="metric-coin">Evaluation coin</label><select id="metric-coin"><option value="ALL">All coins</option></select></div></div>
-            <div class="table-scroll"><table class="metrics-table"><thead><tr><th scope="col">Horizon</th><th scope="col">Model</th><th scope="col">Return MAE</th><th scope="col">Return RMSE</th><th scope="col">Direction</th><th scope="col">Samples</th></tr></thead><tbody id="metric-body"></tbody></table></div>
-            <p id="evaluation-note" class="table-note evaluation-note">The best epoch is selected using validation data, then evaluated on the final test. All-coins rows average each coin equally.</p>
-          </div>
+        <section class="saved-runs-panel panel" aria-labelledby="saved-runs-title">
+          <div class="section-heading"><div><h2 id="saved-runs-title">Saved models</h2><p class="section-caption">Manage fine-tuned models, tokenizers, and partial runs.</p></div></div>
+          <p class="table-note">Remove a run's saved files when you no longer need them. Job history stays available. Original pretrained models are protected.</p>
+          <div id="saved-runs-error" class="notice error" role="alert" hidden></div>
+          <div id="saved-run-list" class="saved-run-list"><p class="empty-small">Checking saved models…</p></div>
+          <p id="saved-runs-feedback" class="field-help" role="status"></p>
         </section>
       </div>
     </div>

@@ -7,7 +7,6 @@ import os
 import subprocess
 import threading
 import urllib.error
-import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -68,7 +67,8 @@ def _post(dashboard, payload=None, path="/api/jobs", **kwargs):
 
 def test_bootstrap_and_static_assets(dashboard):
     _, request, bootstrap, _, _, _ = dashboard
-    assert {"csrf_token", "defaults", "data", "jobs", "runs"} <= bootstrap.keys()
+    assert {"csrf_token", "defaults", "data", "jobs", "chart_models"} <= bootstrap.keys()
+    assert "runs" not in bootstrap
     assert bootstrap["csrf_token"]
     assert bootstrap["defaults"]["input_mode"] == "multiframe"
     assert bootstrap["defaults"]["origin_interval"] == "4h"
@@ -256,73 +256,44 @@ def _saved_run(workspace, name="saved-run"):
     run = workspace / "runs" / name
     run.mkdir(parents=True)
     summary = {"created_at": "2026-10-10T12:00:00+00:00", "data_kind": "historical",
+               "model_type": "kronos-small",
                "best_epoch": 2, "config": {"coins": ["BTC"], "input_mode": "multiframe",
-               "origin_interval": "4h"}, "history": [{"epoch": 1, "train_loss": 0.4,
+               "origin_interval": "4h", "kronos_timeframe": "1d"}, "history": [{"epoch": 1, "train_loss": 0.4,
                "validation_loss": 0.7}], "metrics": {}}
     forecasts = [{"coin": "BTC", "horizon_days": 1, "forecast_price_usdt": 12.5}]
     (run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
     (run / "forecasts.json").write_text(json.dumps(forecasts), encoding="utf-8")
     (run / "report.html").write_text("<!doctype html><p>Saved report</p>", encoding="utf-8")
     (run / "private.csv").write_text("private data", encoding="utf-8")
+    (run / "model.pt").write_bytes(b"saved model checkpoint")
     return run, summary, forecasts
 
 
-def test_saved_runs_return_forecasts_report_and_confined_artifacts(dashboard):
+def test_saved_experiment_browser_routes_are_unavailable(dashboard):
     _, request, _, _, _, workspace = dashboard
-    run, summary, forecasts = _saved_run(workspace)
-    status, listing, _ = request("/api/runs")
-    assert status == 200
-    assert any(item["id"] == run.name for item in listing["runs"])
-    status, detail, _ = request("/api/runs/" + run.name)
-    assert status == 200
-    assert detail["summary"] == summary
-    assert detail["forecasts"] == forecasts
-    status, report, headers = request(detail["report_url"])
-    assert status == 200 and "Saved report" in report
-    assert "text/html" in headers["Content-Type"]
-    assert request("/runs/" + run.name + "/summary.json")[1] == summary
-    assert request("/runs/" + run.name + "/forecasts.json")[1] == forecasts
+    run, _, _ = _saved_run(workspace)
     (run / "model.pt").write_bytes(b"private model checkpoint")
-    assert request("/runs/" + run.name + "/model.pt")[0] == 404
-    assert request("/runs/" + run.name + "/private.csv")[0] == 404
+    for filename in ("forecasts.csv", "validation_predictions.csv", "test_predictions.csv"):
+        (run / filename).write_text("coin,value\nBTC,12.5\n", encoding="utf-8")
+    paths = ["/api/runs", "/api/runs/" + run.name, "/runs/" + run.name + "/report"]
+    paths.extend("/runs/" + run.name + "/" + filename for filename in
+                 ("summary.json", "forecasts.json", "forecasts.csv", "validation_predictions.csv",
+                  "test_predictions.csv", "model.pt", "private.csv"))
+    for path in paths:
+        assert request(path)[0] == 404, path
     assert request("/data/BTC.csv")[0] == 404
 
 
-def test_full_report_artifact_links_download_the_saved_files(dashboard):
-    from crypto_forecast.report import write_report
-
-    _, request, _, _, address, workspace = dashboard
-    run, summary, forecasts = _saved_run(workspace)
-    csv_names = ("forecasts.csv", "validation_predictions.csv", "test_predictions.csv")
-    for filename in csv_names:
-        (run / filename).write_text("coin,value\nBTC,12.5\n", encoding="utf-8")
-    write_report(run, summary, forecasts)
-    report_path = "/runs/" + run.name + "/report"
-    status, report, _ = request(report_path)
-    assert status == 200
-    for filename in ("summary.json", "forecasts.json", *csv_names):
-        assert 'href="' + filename + '"' in report
-        linked = urllib.parse.urljoin(address + report_path, filename)
-        status, body, headers = request(urllib.parse.urlsplit(linked).path)
-        assert status == 200
-        if filename.endswith(".json"):
-            assert body == json.loads((run / filename).read_text(encoding="utf-8"))
-            assert "application/json" in headers["Content-Type"]
-        else:
-            assert body == (run / filename).read_bytes().decode("utf-8")
-            assert "text/csv" in headers["Content-Type"]
-
-
-@pytest.mark.parametrize("path", [
-    "/api/runs/..", "/api/runs/%2e%2e", "/runs/%2e%2e/report",
-    "/runs/saved-run/../report", "/runs/saved-run/%2e%2e/report",
-    "/api/runs/%2e%2e%2fsecret", "/api/runs/%2e%2e%5csecret",
+@pytest.mark.parametrize("identifier", [
+    "..", "../secret", "saved-run/../secret", "..\\secret", "saved-run\\..\\secret",
 ])
-def test_run_routes_reject_traversal(dashboard, path):
+def test_saved_model_selection_rejects_traversal(dashboard, identifier):
+    from test_chart_forecast import payload
+
     _, request, _, _, _, workspace = dashboard
     _saved_run(workspace)
     (workspace / "secret").write_text("must not expose", encoding="utf-8")
-    status, body, _ = request(path)
+    status, body, _ = _post(dashboard, {**payload(), "model": identifier}, path="/api/chart/forecast")
     assert status in {400, 404}
     assert "must not expose" not in str(body)
 
@@ -360,13 +331,14 @@ def test_existing_runs_are_never_overwritten(dashboard):
     assert (run / "report.html").read_bytes() == original
 
 
-@pytest.mark.parametrize("filename", ["summary.json", "forecasts.json", "report.html", "forecasts.csv",
-                                      "validation_predictions.csv", "test_predictions.csv"])
-def test_run_artifact_symlinks_cannot_escape_workspace(dashboard, filename, monkeypatch):
-    _, request, _, _, _, workspace = dashboard
-    run, summary, forecasts = _saved_run(workspace)
+@pytest.mark.parametrize("filename", ["summary.json", "model.pt"])
+def test_saved_model_artifact_symlinks_cannot_escape_workspace(dashboard, filename, monkeypatch):
+    from test_chart_forecast import payload
+
+    server, _, _, _, _, workspace = dashboard
+    run, summary, _ = _saved_run(workspace)
     target = workspace.parent / ("outside-" + filename)
-    content = json.dumps(summary if filename == "summary.json" else forecasts) if filename.endswith(".json") else "outside report"
+    content = json.dumps(summary) if filename.endswith(".json") else "outside checkpoint"
     target.write_text(content, encoding="utf-8")
     artifact = run / filename
     artifact.unlink(missing_ok=True)
@@ -382,10 +354,8 @@ def test_run_artifact_symlinks_cannot_escape_workspace(dashboard, filename, monk
             return target if path == artifact else resolve(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "resolve", redirected)
-    path = "/runs/saved-run/report" if filename == "report.html" else "/runs/saved-run/" + filename
-    assert request(path)[0] == 404
-    if filename in {"summary.json", "forecasts.json"}:
-        assert request("/api/runs/saved-run")[0] == 404
+    assert server.manager.chart_models()["runs"] == []
+    assert _post(dashboard, {**payload(), "model": run.name}, path="/api/chart/forecast")[0] == 400
 
 
 def test_stop_terminates_and_kills_unresponsive_worker(tmp_path, monkeypatch):
@@ -695,31 +665,33 @@ def test_one_dashboard_owns_each_workspace(tmp_path):
     replacement.server_close()
 
 
-@pytest.mark.parametrize("job_status", ["queued", "running", "stopped", "failed"])
-def test_unfinished_or_cancelled_training_artifacts_are_not_results(dashboard, job_status):
+@pytest.mark.parametrize("job_status", ["queued", "running", "stopped", "failed", "interrupted"])
+def test_unfinished_or_cancelled_training_models_are_unavailable(dashboard, job_status):
+    from test_chart_forecast import payload
+
     server, request, _, _, _, workspace = dashboard
     status, job, _ = _post(dashboard, _payload())
     assert status == 201
     _saved_run(workspace, job["id"])
     server.manager._update_job(job["id"], status=job_status)
-    status, listing, _ = request("/api/runs")
+    status, bootstrap, _ = request("/api/bootstrap")
     assert status == 200
-    assert all(item["id"] != job["id"] for item in listing["runs"])
-    assert request("/api/runs/" + job["id"])[0] == 404
-    assert request("/runs/" + job["id"] + "/report")[0] == 404
+    assert all(item["id"] != job["id"] for item in bootstrap["chart_models"]["runs"])
+    assert _post(dashboard, {**payload(), "model": job["id"]}, path="/api/chart/forecast")[0] == 400
 
 
-def test_completed_training_artifacts_are_visible(dashboard):
+def test_completed_training_models_remain_selectable(dashboard):
+    from test_chart_forecast import payload
+
     server, request, _, _, _, workspace = dashboard
     status, job, _ = _post(dashboard, _payload())
     assert status == 201
     _saved_run(workspace, job["id"])
     server.manager._update_job(job["id"], status="completed")
-    status, listing, _ = request("/api/runs")
+    status, bootstrap, _ = request("/api/bootstrap")
     assert status == 200
-    assert any(item["id"] == job["id"] for item in listing["runs"])
-    assert request("/api/runs/" + job["id"])[0] == 200
-    assert request("/runs/" + job["id"] + "/report")[0] == 200
+    assert any(item["id"] == job["id"] for item in bootstrap["chart_models"]["runs"])
+    assert _post(dashboard, {**payload(), "model": job["id"]}, path="/api/chart/forecast")[0] == 201
 
 
 def test_progress_snapshot_retries_windows_sharing_conflicts(tmp_path, monkeypatch):

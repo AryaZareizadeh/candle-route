@@ -40,6 +40,32 @@ def save_tokenizer(run_dir, state, constructor, summary):
         os.replace(stage / "tokenizer_summary.json", directory / "tokenizer_summary.json")
 
 
+def save_predictor(run_dir, state, tokenizer_state, metadata, summary):
+    """Save best training weights independently of forecast/report publication.
+
+    The paired tokenizer and full metadata make the checkpoint self-contained.
+    Replace the checkpoint only after both new files have been written; a failed
+    write leaves the previous best weights intact. Metadata in predictor.pt is
+    authoritative if publication of the lightweight inventory view is interrupted.
+    """
+    directory = Path(run_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(summary, allow_nan=False, indent=2)
+    with tempfile.TemporaryDirectory(prefix=".predictor-stage-", dir=directory) as temporary:
+        stage = Path(temporary)
+        with (stage / "predictor.pt").open("wb") as handle:
+            torch.save({"state_dict": state, "tokenizer_state_dict": tokenizer_state,
+                        "metadata": metadata}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with (stage / "predictor_summary.json").open("w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(stage / "predictor.pt", directory / "predictor.pt")
+        os.replace(stage / "predictor_summary.json", directory / "predictor_summary.json")
+
+
 def tokenizer_summary(config, constructor, training, *, signature, manifest, splits,
                       coins, state_hash, complete, data_kind):
     return {"artifact_type": "kronos-tokenizer", "format_version": 1,

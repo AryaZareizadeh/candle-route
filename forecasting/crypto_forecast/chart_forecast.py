@@ -168,6 +168,7 @@ def forecast_chart(workspace, value, chart, *, progress=lambda _: None):
     torch.set_num_threads(min(4, os.cpu_count() or 1))
     device = _device(value["device"])
     progress("Loading Kronos for read-only inference.")
+    evaluation_complete = True
     if value["model"] in ORIGINAL_MODELS:
         variant = ORIGINAL_MODELS[value["model"]]
         model_path, tokenizer_path = original_paths(workspace, variant)
@@ -176,9 +177,18 @@ def forecast_chart(workspace, value, chart, *, progress=lambda _: None):
         label = f"{variant.capitalize()} · original pretrained weights"
     else:
         # The dashboard validates this run identifier and confines its path.
-        path = _inside(workspace, Path("runs") / value["model"] / "model.pt")
+        filename = value.get("checkpoint_file", "model.pt")
+        if filename not in {"model.pt", "predictor.pt"}:
+            raise ValueError("Saved Kronos checkpoint selection is incompatible.")
+        path = _inside(workspace, Path("runs") / value["model"] / filename)
+        recovery = filename == "predictor.pt" or ("checkpoint_file" not in value and not path.is_file())
+        if recovery:
+            path = _inside(workspace, Path("runs") / value["model"] / "predictor.pt")
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         metadata = checkpoint["metadata"]
+        if recovery and (metadata.get("artifact_type") != "kronos-predictor"
+                         or metadata.get("evaluation_complete") is not False):
+            raise ValueError("Saved predictor recovery checkpoint is incompatible.")
         if (metadata.get("format_version") not in (3, 4) or metadata.get("model_type") not in PRETRAINED_MODELS
                 or metadata.get("features") != list(RAW_FEATURES)
                 or metadata.get("timeframes") != [value["timeframe"]]):
@@ -188,6 +198,9 @@ def forecast_chart(workspace, value, chart, *, progress=lambda _: None):
         model.load_state_dict(checkpoint["state_dict"])
         tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
         label = f"{metadata['model_type'].capitalize()} · fine-tuned run {value['model']}"
+        evaluation_complete = not recovery
+        if recovery:
+            label += " · evaluation incomplete"
     model.eval().requires_grad_(False)
     tokenizer.eval().requires_grad_(False)
     predictor = KronosPredictor(model, tokenizer, device=str(device), max_context=512)
@@ -215,6 +228,7 @@ def forecast_chart(workspace, value, chart, *, progress=lambda _: None):
     raw_prediction["timestamp"] = future.to_numpy()
     return {**chart, "forecast": rows(prediction), "raw_forecast": rows(raw_prediction),
             "model_label": label, "model": value["model"], "device": str(device),
+            "evaluation_complete": evaluation_complete,
             "settings": {key: value[key] for key in ("horizon", "lookback", "seed", "sample_count", "temperature", "top_p")},
             "adjusted_candles": adjusted,
             "adjustment_note": "Predicted high/low ranges include open and close; negative volume is clipped to zero. Raw outputs are retained in JSON."}

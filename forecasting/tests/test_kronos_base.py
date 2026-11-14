@@ -51,7 +51,6 @@ def test_base_finetune_checkpoint_roundtrip_and_chart_selection(tmp_path, monkey
     run.mkdir(parents=True)
     torch.save(checkpoint, run / "model.pt")
     (run / "summary.json").write_text(json.dumps(summary))
-    (run / "forecasts.json").write_text("[]")
     result = forecast_chart(tmp_path, value, chart)
     assert result["model_label"].startswith("Kronos-base")
     manager = JobManager(tmp_path)

@@ -16,6 +16,7 @@ import pickle
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -307,14 +308,17 @@ class JobManager:
                 raise DashboardError(409, "Dashboard is shutting down.")
             if any(job["status"] in ACTIVE for job in self.list_jobs()):
                 raise DashboardError(409, "A job is already running. Wait for it to finish or stop it first.")
+            if config.kronos_tokenizer_run_dir:
+                # Deletion shares this lock. Recheck after validation so a
+                # concurrent removal cannot leave a newly queued job orphaned.
+                self._tokenizer_path(Path(config.kronos_tokenizer_run_dir).name)
             now = utc_now()
             job = {"id": identifier, "name": name.strip() or identifier, "operation": operation,
                    "status": "queued", "stage": "starting", "started_at": now, "updated_at": now,
                    "finished_at": None, "elapsed_seconds": 0, "config": asdict(config),
                    "history": [], "progress": {"epoch": 0, "max_epochs": config.kronos_tokenizer_epochs
                        if config.kronos_training_stage == "tokenizer" else config.epochs},
-                   "logs": [], "error": None, "pending_decision": None,
-                   "run_id": identifier if operation == "train" else None}
+                   "logs": [], "error": None, "pending_decision": None}
             write_json(self._path(identifier), job)
             try:
                 self._launch(job)
@@ -354,8 +358,22 @@ class JobManager:
             except ValueError:
                 ready = False
             pretrained.append({"id": identifier, "name": variant.capitalize(), "ready": ready})
+        saved = []
+        for path in (self.workspace / "runs").iterdir() if (self.workspace / "runs").is_dir() else []:
+            try:
+                summary = self._saved_model_summary(path.name)
+                try:
+                    name = self.get_job(path.name)["name"]
+                except DashboardError:
+                    name = path.name
+                recovery = summary.get("checkpoint_file") == "predictor.pt"
+                saved.append({"id": path.name, "name": name + (" · training weights · evaluation incomplete" if recovery else ""),
+                              "created_at": summary.get("created_at"), "evaluation_complete": not recovery,
+                              "coins": summary.get("coins", []), "model_type": summary["model_type"]})
+            except (ValueError, OSError):
+                continue
         return {"original_ready": pretrained[0]["ready"], "pretrained": pretrained,
-                "runs": [run for run in self.list_runs() if run["model_type"] in ORIGINAL_MODELS.values()]}
+                "runs": sorted(saved, key=lambda item: item["created_at"] or "", reverse=True)}
 
     def testing_chart(self, payload):
         from .chart_forecast import testing_chart
@@ -371,18 +389,19 @@ class JobManager:
             if value["model"] in ORIGINAL_MODELS:
                 original_paths(self.workspace, ORIGINAL_MODELS[value["model"]])
             else:
-                directory = self._run_path(value["model"])
-                detail = self.run_detail(value["model"])
-                if (detail["summary"].get("model_type") not in ORIGINAL_MODELS.values()
-                        or detail["summary"].get("config", {}).get("kronos_timeframe") != value["timeframe"]):
+                summary = self._saved_model_summary(value["model"])
+                if summary["config"].get("kronos_timeframe") != value["timeframe"]:
                     raise ValueError("Choose a saved Kronos run trained on this candle interval.")
-                if not self.artifact(directory, "model.pt").is_file():
-                    raise ValueError("Saved Kronos checkpoint is unavailable.")
+                value["checkpoint_file"] = summary["checkpoint_file"]
         except (ValueError, TypeError, OSError) as error:
             raise DashboardError(400, str(error)) from error
         with self.lock:
             if self.closed or any(job["status"] in ACTIVE for job in self.list_jobs()):
                 raise DashboardError(409, "A job is already running or the dashboard is shutting down. Wait or stop it first.")
+            if value["model"] not in ORIGINAL_MODELS:
+                source = self._managed_run_path(value["model"])
+                if not self.artifact(source, value["checkpoint_file"]).is_file():
+                    raise DashboardError(404, "Saved predictor weights are unavailable.")
             identifier = f"forecast-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
             now = utc_now()
             value.pop("csv", None)
@@ -390,7 +409,7 @@ class JobManager:
                    "operation": "forecast", "config": value, "status": "queued", "stage": "starting",
                    "started_at": now, "updated_at": now, "finished_at": None, "elapsed_seconds": 0,
                    "history": [], "progress": {}, "logs": [], "error": None,
-                   "pending_decision": None, "run_id": None}
+                   "pending_decision": None}
             if testing:
                 job.update(mode="testing", anchor=chart["selected_candle"])
                 job["name"] += " · " + chart["selected_candle"][:16].replace("T", " ") + " UTC"
@@ -636,34 +655,146 @@ class JobManager:
             raise DashboardError(404, "Run artifact is not available inside its run folder.")
         return path
 
-    def run_detail(self, identifier):
-        path = self._run_path(identifier)
+    def _saved_model_summary(self, identifier):
+        from .chart_forecast import ORIGINAL_MODELS
+        path = self._managed_run_path(identifier)
         try:
-            summary = json.loads(self.artifact(path, "summary.json").read_text(encoding="utf-8"))
-            forecasts = json.loads(self.artifact(path, "forecasts.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise DashboardError(404, "Run results are not available yet.") from None
-        summary.pop("data_manifest", None)
-        try:
-            name = self.get_job(identifier)["name"]
+            job = self.get_job(identifier)
         except DashboardError:
-            name = identifier
-        return {"id": identifier, "name": name, "summary": summary, "forecasts": forecasts,
-                "report_url": f"/runs/{identifier}/report"}
+            job = None
+        if job is not None and job["status"] in ACTIVE:
+            raise DashboardError(404, "This training run is still active.")
+        try:
+            completed = job is None or job["status"] == "completed"
+            if completed and self.artifact(path, "model.pt").is_file():
+                summary = read_json(self.artifact(path, "summary.json"))
+                filename = "model.pt"
+            else:
+                checkpoint = self.artifact(path, "predictor.pt")
+                if not checkpoint.is_file():
+                    raise DashboardError(404, "Saved predictor weights are unavailable.")
+                # The checkpoint remains authoritative if its inventory view was
+                # interrupted between atomic replacements.
+                summary = None
+                try:
+                    view = self.artifact(path, "predictor_summary.json")
+                    if view.stat().st_mtime_ns >= checkpoint.stat().st_mtime_ns:
+                        summary = read_json(view)
+                except (OSError, ValueError):
+                    pass
+                if (not isinstance(summary, dict) or summary.get("artifact_type") != "kronos-predictor"
+                        or not isinstance(summary.get("config"), dict) or summary.get("model_type") not in ORIGINAL_MODELS.values()):
+                    import torch
+                    summary = torch.load(checkpoint, map_location="cpu", weights_only=True)["metadata"]
+                if not isinstance(summary, dict) or summary.get("artifact_type") != "kronos-predictor":
+                    raise ValueError("Unsupported predictor checkpoint.")
+                filename = "predictor.pt"
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, EOFError, pickle.UnpicklingError):
+            raise DashboardError(404, "Saved model settings are unavailable.") from None
+        if (not isinstance(summary, dict) or summary.get("model_type") not in ORIGINAL_MODELS.values()
+                or not isinstance(summary.get("config"), dict)):
+            raise DashboardError(400, "Choose a saved Kronos run trained on this candle interval.")
+        return {**summary, "checkpoint_file": filename}
 
-    def list_runs(self):
-        runs = []
-        for path in (self.workspace / "runs").glob("*/summary.json"):
+    @staticmethod
+    def _linked_path(path):
+        info = path.lstat()
+        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) &
+                                                 getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024))
+
+    def _managed_run_path(self, identifier):
+        from .chart_forecast import ORIGINAL_MODELS
+        if (not isinstance(identifier, str) or not IDENTIFIER.fullmatch(identifier)
+                or identifier in ORIGINAL_MODELS):
+            raise DashboardError(404, "Saved run not found. Original models cannot be removed.")
+        root = self.workspace / "runs"
+        path = root / identifier
+        try:
+            if (self._linked_path(root) or root.resolve() != root or self._linked_path(path)
+                    or not path.is_dir() or path.resolve().parent != root):
+                raise DashboardError(400, "Saved run must be a local folder inside this project's runs folder.")
+        except FileNotFoundError:
+            raise DashboardError(404, "Saved run not found.") from None
+        return path
+
+    def list_saved_runs(self):
+        entries = []
+        root = self.workspace / "runs"
+        if not root.is_dir() or self._linked_path(root) or root.resolve() != root:
+            return entries
+        for directory in root.iterdir():
             try:
-                detail = self.run_detail(path.parent.name)
-                summary = detail["summary"]
-                runs.append({"id": detail["id"], "name": detail["name"], "created_at": summary.get("created_at"),
-                             "coins": summary.get("coins", []), "input_mode": summary.get("config", {}).get("input_mode", "daily"),
-                             "model_type": summary.get("model_type", summary.get("config", {}).get("model_type", "gru")),
-                             "best_epoch": summary.get("best_epoch"), "data_kind": summary.get("data_kind")})
-            except (ValueError, OSError):
+                path = self._managed_run_path(directory.name)
+                try:
+                    job = self.get_job(path.name)
+                except DashboardError:
+                    job = None
+                artifacts = []
+                for name in ("model.pt", "tokenizer.pt", "predictor.pt", "summary.json",
+                             "tokenizer_summary.json", "predictor_summary.json"):
+                    try:
+                        if (path / name).is_file():
+                            artifacts.append(name)
+                    except OSError:
+                        # A known failed job can still be listed when its
+                        # incomplete artifact is unreadable.
+                        continue
+                if not artifacts and (job is None or job.get("operation") != "train"):
+                    continue
+                entries.append({"id": path.name, "name": job.get("name", path.name) if job else path.name,
+                                "status": job.get("status", "saved") if job else "saved",
+                                "created_at": job.get("started_at") if job else None,
+                                "artifacts": artifacts,
+                                "removable": not job or job.get("status") not in ACTIVE})
+            except (DashboardError, OSError, ValueError, KeyError):
                 continue
-        return sorted(runs, key=lambda item: item["created_at"] or "", reverse=True)
+        return sorted(entries, key=lambda item: item["created_at"] or item["id"], reverse=True)
+
+    def remove_run(self, identifier):
+        with self.lock:
+            if self.closed:
+                raise DashboardError(409, "The dashboard is shutting down.")
+            path = self._managed_run_path(identifier)
+            if identifier not in {entry["id"] for entry in self.list_saved_runs()}:
+                raise DashboardError(404, "Managed saved run not found.")
+            owner = self.processes.get(identifier)
+            if identifier in self.stopping or (owner is not None and owner.poll() is None):
+                raise DashboardError(409, "This saved run is in use. Stop its active job before removing it.")
+            for snapshot in self.jobs_dir.glob("*.json"):
+                try:
+                    job = self.get_job(snapshot.stem)
+                except (DashboardError, ValueError, OSError, KeyError):
+                    continue
+                config = job.get("config", {})
+                process = self.processes.get(job["id"])
+                running = job.get("status") in ACTIVE or (process is not None and process.poll() is None)
+                if running and (job["id"] == identifier or config.get("model") == identifier
+                                or any(config.get(field) and Path(config[field]).resolve() == path
+                                       for field in ("run_dir", "kronos_tokenizer_run_dir"))):
+                    raise DashboardError(409, "This saved run is in use. Stop its active job before removing it.")
+            # Verify the complete tree before deleting anything. Reparse points
+            # include Windows junctions, which is_symlink alone does not detect.
+            try:
+                pending = [path]
+                while pending:
+                    directory = pending.pop()
+                    if self._linked_path(directory) or not directory.resolve().is_relative_to(path):
+                        raise DashboardError(400, "Saved run contains a linked path. Remove the link before deleting this run.")
+                    for child in directory.iterdir():
+                        if self._linked_path(child) or not child.resolve().is_relative_to(path):
+                            raise DashboardError(400, "Saved run contains a linked path. Remove the link before deleting this run.")
+                        if child.is_dir():
+                            pending.append(child)
+                # rmtree also refuses directory symlinks and does not traverse
+                # Windows junction targets if a link appears after validation.
+                shutil.rmtree(path)
+            except OSError as error:
+                raise DashboardError(409, f"Could not remove the saved run: {error}") from error
+            try:
+                self._update_job(identifier, artifacts_removed_at=utc_now())
+            except DashboardError:
+                pass
+            return {"id": identifier, "removed": True}
 
     def _tokenizer_path(self, identifier):
         """Select an independent artifact, including one from a stopped job."""
@@ -776,7 +907,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 import torch
                 self._send(200, {"csrf_token": self.server.csrf_token, "defaults": manager.defaults(),
                                  "data": manager.data_status(), "hardware": {"cuda_available": torch.cuda.is_available()},
-                                 "jobs": manager.list_jobs(), "runs": manager.list_runs(),
+                                 "jobs": manager.list_jobs(),
+                                 "saved_runs": manager.list_saved_runs(),
                                  "tokenizers": manager.list_tokenizers(),
                                  "chart_models": manager.chart_models(),
                                  "models": list(MODEL_SPECS.values())})
@@ -787,20 +919,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200, manager.chart_result(path.split("/")[-1]))
             elif re.fullmatch(r"/api/jobs/[^/]+", path):
                 self._send(200, manager.get_job(path.split("/")[-1]))
-            elif path == "/api/runs":
-                self._send(200, {"runs": manager.list_runs()})
             elif path == "/api/tokenizers":
                 self._send(200, {"tokenizers": manager.list_tokenizers()})
-            elif re.fullmatch(r"/api/runs/[^/]+", path):
-                self._send(200, manager.run_detail(path.split("/")[-1]))
-            elif re.fullmatch(r"/runs/[^/]+/report", path):
-                directory = manager._run_path(path.split("/")[2])
-                self._send(200, manager.artifact(directory, "report.html").read_bytes(), "text/html; charset=utf-8")
-            elif re.fullmatch(r"/runs/[^/]+/(summary\.json|forecasts\.json|forecasts\.csv|validation_predictions\.csv|test_predictions\.csv)", path):
-                directory = manager._run_path(path.split("/")[2])
-                filename = path.split("/")[-1]
-                mime = "application/json; charset=utf-8" if filename.endswith(".json") else "text/csv; charset=utf-8"
-                self._send(200, manager.artifact(directory, filename).read_bytes(), mime)
+            elif path == "/api/saved-runs":
+                self._send(200, {"saved_runs": manager.list_saved_runs()})
             else:
                 raise DashboardError(404, "Page not found.")
         except DashboardError as error:
@@ -824,7 +946,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Closing with unread TCP bytes can reset a Windows client's socket.
             self._trusted(mutation=True)
             path = unquote(urlsplit(self.path).path)
-            if path in ("/api/jobs", "/api/chart/preview", "/api/chart/forecast", "/api/testing/chart", "/api/testing/forecast") or re.fullmatch(r"/api/jobs/[^/]+/decision", path):
+            if path in ("/api/jobs", "/api/chart/preview", "/api/chart/forecast", "/api/testing/chart", "/api/testing/forecast") or re.fullmatch(r"/api/jobs/[^/]+/decision|/api/runs/[^/]+/delete", path):
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                     raise DashboardError(400, "Send settings as JSON.")
                 try:
@@ -843,6 +965,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send(200, self.server.manager.testing_chart(payload))
                 elif path == "/api/testing/forecast":
                     self._send(201, self.server.manager.start_chart_forecast(payload, testing=True))
+                elif re.fullmatch(r"/api/runs/[^/]+/delete", path):
+                    if payload != {}:
+                        raise DashboardError(400, "Send an empty JSON object to remove a saved run.")
+                    self._send(200, self.server.manager.remove_run(path.split("/")[3]))
                 else:
                     self._send(200, self.server.manager.decide_training(path.split("/")[3], payload))
             elif re.fullmatch(r"/api/jobs/[^/]+/stop", path):

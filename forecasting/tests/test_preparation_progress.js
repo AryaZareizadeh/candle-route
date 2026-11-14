@@ -6,7 +6,8 @@ const vm = require("node:vm");
 
 // Exercise the actual monitor renderer with a small DOM and no chart/browser dependencies.
 const app = fs.readFileSync(path.join(__dirname, "../crypto_forecast/web/app.js"), "utf8");
-const renderer = app.slice(app.indexOf("  function renderMonitor()"), app.indexOf("  function renderRuns()"));
+const rendererStart = app.indexOf("  function renderMonitor()");
+const renderer = app.slice(rendererStart, app.indexOf("\n  }", rendererStart) + 4);
 function monitor(job) {
   const elements = new Map();
   const context = {
