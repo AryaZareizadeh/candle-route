@@ -23,6 +23,25 @@ PUBLIC = {"/api/auth/login", "/api/auth/session"}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
+def is_forecast_path(path):
+    return path == "/forecasting" or path.startswith("/forecasting/")
+
+
+def forecast_session_headers(scope, session, csrf):
+    """Detect stale embedded API pages after an account or session switch."""
+    if not is_forecast_path(scope["path"]):
+        return True
+    if scope["method"] in SAFE_METHODS and csrf is not None:
+        if not hmac.compare_digest(csrf.encode(), session.csrf_token.encode()):
+            return False
+    scope["forecast_csrf_token"] = session.csrf_token
+    return True
+
+
+def frame_options(path):
+    return b"SAMEORIGIN" if path == "/forecasting/" else b"DENY"
+
+
 class AuthWorkBusy(RuntimeError):
     pass
 
@@ -161,21 +180,26 @@ class AuthMiddleware:
             return await reject(400, "Invalid host or origin")
 
         path = scope["path"]
-        protected = path.startswith("/api/") or socket or path in {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+        protected = (path.startswith("/api/") or is_forecast_path(path) or socket
+                     or path in {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"})
         session = state.session(conn.cookies.get(COOKIE))
         if protected and path not in PUBLIC:
             if not session:
                 return await reject(401, "Authentication required")
-            if not socket and scope["method"] not in SAFE_METHODS:
-                csrf = conn.headers.get("x-csrf-token", "")
-                if not hmac.compare_digest(csrf.encode(), session.csrf_token.encode()):
+            if not socket:
+                csrf = conn.headers.get("x-csrf-token")
+                if scope["method"] not in SAFE_METHODS and not hmac.compare_digest(
+                    (csrf or "").encode(), session.csrf_token.encode(),
+                ):
                     return await reject(403, "Invalid CSRF token")
+                if not forecast_session_headers(scope, session, csrf):
+                    return await reject(401, "Authentication required")
 
         async def guarded_send(message):
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 headers.extend([(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"),
-                                (b"x-frame-options", b"DENY"), (b"referrer-policy", b"no-referrer")])
+                                (b"x-frame-options", frame_options(path)), (b"referrer-policy", b"no-referrer")])
                 message = {**message, "headers": headers}
             await send(message)
 

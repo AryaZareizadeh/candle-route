@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trading Bot Dashboard</title>
+<title>CandleRoute</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -304,6 +304,7 @@
   .main-tab-btn { background: none; border: none; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; color: var(--muted); padding: 12px 18px; border-bottom: 2px solid transparent; transition: color .15s, border-color .15s; letter-spacing: .1px; }
   .main-tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
   .main-tab-btn:hover:not(.active) { color: var(--text); }
+  #forecastingFrame { display: block; width: 100%; height: max(28rem, calc(100dvh - 7rem)); border: 0; }
   .portfolio-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(290px,1fr)); gap: 14px; padding: 18px 24px; }
   .portfolio-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 18px; min-width: 0; }
   .portfolio-panel h3 { margin: 0 0 12px; font-size: 15px; }
@@ -640,7 +641,7 @@
 <!-- Top Bar -->
 <div class="topbar">
   <div class="topbar-left">
-    <h1>Trading bots</h1>
+    <h1>CandleRoute</h1>
     <div class="ws-indicator">
       <div class="ws-dot" id="wsDot"></div>
       <span id="wsLabel">Connecting…</span>
@@ -665,6 +666,7 @@
   <button class="main-tab-btn active" data-view="Bots" onclick="switchView('Bots')">Bots</button>
   <button class="main-tab-btn" data-view="AIBots" onclick="switchView('AIBots')">AI Bots</button>
   <button class="main-tab-btn" data-view="ModelTrainer" onclick="switchView('ModelTrainer')">Model Trainer</button>
+  <button class="main-tab-btn" data-view="Forecasting" onclick="switchView('Forecasting')">Forecasting</button>
   <button class="main-tab-btn" data-view="PortfolioManager" onclick="switchView('PortfolioManager')">Portfolio Manager</button>
   <button class="main-tab-btn" data-view="Optimizer" onclick="switchView('Optimizer')">Optimizer</button>
 </div>
@@ -832,6 +834,10 @@
   </div>
 </div><!-- /viewModelTrainer -->
 
+<div id="viewForecasting" class="view-pane">
+  <iframe id="forecastingFrame" title="Forecasting workspace"></iframe>
+</div>
+
 <!-- ═══════════════════ PORTFOLIO MANAGER VIEW ═══════════════════ -->
 <div id="viewPortfolioManager" class="view-pane">
   <div class="research-intro">
@@ -853,7 +859,7 @@
       <h3 id="managerSetupTitle">1. Choose assets and a budget</h3><p class="portfolio-note">Select the assets the model may hold. Unallocated capital stays in USDT.</p>
       <div id="managerAssets" class="manager-assets" onchange="updateManagedControls()"></div>
       <div class="portfolio-controls"><label>Starting balance (USDT)<input id="managerBudget" type="number" min="0.01" max="100000" step="0.01" value="200" oninput="updateManagedControls()" aria-describedby="managerSetupNote"></label></div>
-      <p id="managerSetupNote" class="portfolio-note">Your first start saves this budget and asset list. They stay fixed when you pause or resume.</p>
+      <p id="managerSetupNote" class="portfolio-note">Your first start saves the budget, assets, and paper signal model.</p>
       <div id="managerSetupError" class="portfolio-note" role="alert" style="color:var(--red)"></div>
     </section>
     <section class="portfolio-panel" aria-labelledby="managerValidationTitle">
@@ -864,6 +870,12 @@
     </section>
     <section class="portfolio-panel wide" aria-labelledby="managerPerformanceTitle">
       <div class="manager-panel-head"><div><h3 id="managerPerformanceTitle">3. Follow paper performance</h3><p id="managerModelNote" class="portfolio-note">Complete research to enable paper trading.</p></div><div class="portfolio-controls"><button id="managerStartBtn" class="btn btn-success" onclick="startManagedPaper()" disabled>Start paper trading</button><button id="managerStopBtn" class="btn btn-neutral" onclick="stopManagedPaper()" disabled>Pause paper trading</button></div></div>
+      <div class="portfolio-controls"><label>Paper signal model
+        <select id="managerSignalModel" onchange="updateManagedControls()" aria-describedby="managerModelNote">
+          <option value="research">Historical research model</option>
+          <option value="kronos-small">Kronos-small forecast</option>
+        </select>
+      </label></div>
       <p id="managerObservation" class="portfolio-note"></p><div id="managerEquity"></div>
       <div class="manager-activity"><div><h4>Recent decisions</h4><div id="managerDecisions"></div></div><div><h4>Recent estimated trades</h4><div id="managerFills"></div></div>
       <details class="manager-details"><summary>How paper trading works</summary><p class="portfolio-note">The service checks public data every minute, records hourly observations, and evaluates allocation every four hours. Fees and available order-book depth affect estimated trades. Pausing keeps virtual holdings and history; it does not sell assets. After an application restart, resume explicitly. Research results use estimated historical costs and are not a guarantee of future returns.</p></details>
@@ -1440,6 +1452,16 @@ const sessionLifecycle = window.DashboardSession.create({fetch:nativeFetch,
   onUnauthorized:() => showLogin('Your session ended. Sign in again.')});
 let activeDashboardView = 'Bots';
 const initialDashboardHTML = document.getElementById('dashboard').innerHTML;
+function forecastingParentToken(frame) {
+  return authenticated && frame === document.getElementById('forecastingFrame') ? csrfToken : null;
+}
+window.addEventListener?.('message', event => {
+  const frame = document.getElementById('forecastingFrame');
+  if (authenticated && event.origin === window.location.origin && frame?.contentWindow
+      && event.source === frame.contentWindow && event.data === 'forecasting-session-ended') {
+    showLogin('Your session ended. Sign in again.');
+  }
+});
 
 async function apiFetch(url, options = {}) {
   return sessionLifecycle.request(url,options);
@@ -1496,6 +1518,7 @@ function showAuthForm(name, clearMessage = true) {
 }
 
 function clearPrivateDashboard() {
+  document.getElementById('forecastingFrame')?.removeAttribute?.('src');
   destroyBotHistCharts(); destroyOptCharts(); destroyOptTesterCharts();
   marketClockOffsetMs = 0;
   clearTimeout(walletRefreshTimer);
@@ -3728,6 +3751,10 @@ function switchView(view) {
   if (view === 'Optimizer') initOptimizerTab();
   if (view === 'PortfolioManager') loadPortfolio();
   if (view === 'ModelTrainer') loadModelTrainer();
+  if (view === 'Forecasting' && authenticated) {
+    const frame = document.getElementById('forecastingFrame');
+    if (!frame.getAttribute('src')) frame.setAttribute('src', '/forecasting/');
+  }
 }
 
 // Model Trainer and saved AlexNet models
@@ -4465,9 +4492,19 @@ function managedFeedback(message, tone = '') {
   pane.textContent = message;
   pane.dataset.tone = tone;
 }
+function managedSignalModel() {
+  const model = managerData?.paper
+    ? managerData.paper.signal_model : document.getElementById('managerSignalModel').value;
+  return model === 'kronos-small' ? model : 'research';
+}
+function managedModelStatus() {
+  if (managedSignalModel() === 'kronos-small') return managerData?.kronos_status;
+  return managerData?.model_status;
+}
 function managerModelReady() {
   if (!managerData) return false;
-  const model = managerData.model_status;
+  const model = managedModelStatus();
+  if (managedSignalModel() === 'kronos-small') return model?.ready === true;
   if (!model) return !!managerData.research;
   if (!model.ready) return false;
   return !model.assets?.length || selectedManagedAssets().some(asset => model.assets.includes(asset));
@@ -4488,7 +4525,16 @@ function updateManagedControls() {
   research.textContent = researching ? 'Research running…' : 'Run research';
   document.getElementById('managerBudget').disabled = !!paper || busy;
   document.getElementById('managerDays').disabled = busy;
+  document.getElementById('managerSignalModel').disabled = !!paper || busy || !managerData;
   document.querySelectorAll('.manager-asset').forEach(input => { input.disabled = !!paper || busy; });
+  const model = managedModelStatus();
+  const useKronos = managedSignalModel() === 'kronos-small';
+  const uncovered = model?.assets?.length ? selectedManagedAssets().filter(asset => !model.assets.includes(asset)) : model?.missing_paper_assets || [];
+  document.getElementById('managerModelNote').textContent = useKronos
+    ? model?.ready ? 'Kronos-small forecasts the next four hourly candles using public prices.' : model?.reason || 'Set up the original Kronos-small weights in Forecasting.'
+    : managerModelReady()
+      ? 'Model ready' + (model?.method ? ': ' + model.method : '') + '. ' + (uncovered.length ? 'No trained model for ' + uncovered.join(', ') + '; these assets are skipped.' : 'Paper trading uses the saved model and public prices.')
+      : model?.reason || 'Complete research for your selected assets to enable paper trading.';
 }
 function managerSetupPayload(research = false) {
   const assets = selectedManagedAssets();
@@ -4500,6 +4546,8 @@ function managerSetupPayload(research = false) {
     const days = Number(document.getElementById('managerDays').value);
     if (!Number.isInteger(days) || days < 90 || days > 730) throw new Error('Enter a whole number of history days from 90 to 730.');
     payload.days = days;
+  } else if (!managerData?.paper && managedSignalModel() === 'kronos-small') {
+    payload.signal_model = 'kronos-small';
   }
   return payload;
 }
@@ -4516,10 +4564,13 @@ function renderPortfolioManager(data) {
   // Keep checkbox focus and unsaved choices intact during automatic refreshes.
   if (!existingInputs.length || JSON.stringify(managerData?.approved_assets) !== JSON.stringify(data.approved_assets) || !!managerData?.paper !== !!paper || (paper && JSON.stringify(managerData?.paper?.assets) !== JSON.stringify(paper.assets))) assetsPane.innerHTML = assetMarkup;
   managerData = data;
-  if (paper) document.getElementById('managerBudget').value = paper.budget_usdt;
+  if (paper) {
+    document.getElementById('managerBudget').value = paper.budget_usdt;
+    document.getElementById('managerSignalModel').value = managedSignalModel();
+  }
   document.getElementById('managerSetupNote').textContent = paper
-    ? 'Saved setup: ' + paper.assets.join(', ') + '. Budget and assets stay fixed. Pausing keeps your holdings and history.'
-    : 'Your first start saves this budget and asset list. They stay fixed when you pause or resume.';
+    ? 'Saved assets: ' + paper.assets.join(', ') + '. Pausing keeps your holdings and history.'
+    : 'Your first start saves the budget, assets, and paper signal model.';
   const ready = managerModelReady();
   const latest = paper?.equity?.at(-1);
   const incomplete = latest?.complete === false;
@@ -4528,8 +4579,8 @@ function renderPortfolioManager(data) {
   badge.textContent = statusText;
   badge.dataset.tone = statusText === 'Running' ? 'success' : statusText === 'Needs attention' ? 'warning' : '';
   document.getElementById('managerStatus').textContent = paper
-    ? (paper.running ? 'Paper trading running' : 'Paper trading paused') + (data.paper_error ? '. ' + data.paper_error : incomplete ? '. Incomplete valuation; missing prices for ' + (latest.unpriced || []).join(', ') + '.' : !ready ? '. ' + (data.model_status?.reason || 'Complete research to enable decisions.') : '. Virtual holdings and history are saved.')
-    : 'No managed paper portfolio yet. Set up and validate below to get started.';
+    ? (paper.running ? 'Paper trading running' : 'Paper trading paused') + (data.paper_error ? '. ' + data.paper_error : incomplete ? '. Incomplete valuation; missing prices for ' + (latest.unpriced || []).join(', ') + '.' : !ready ? '. ' + (managedModelStatus()?.reason || 'The selected signal model is unavailable.') : '. Virtual holdings and history are saved.')
+    : 'No managed paper portfolio yet.';
   const capital = Number(paper?.budget_usdt || 200);
   const equity = latest ? (incomplete ? null : latest.equity_usdt) : Object.values(paper?.holdings || {}).some(qty => Number(qty) > 0) ? null : capital;
   const pnl = equity == null ? null : Number(equity) - capital - Number(paper?.flow_offset_usdt || 0);
@@ -4545,7 +4596,7 @@ function renderPortfolioManager(data) {
   document.getElementById('managerHoldings').innerHTML = paper ? managedTable(['Holding', 'Quantity'], [
     `<tr><td>USDT · virtual cash</td><td>${escHtml(portfolioMoney(paper.cash_usdt))}</td></tr>`,
     ...holdings.map(([asset,qty]) => `<tr><td>${escHtml(asset)}</td><td>${escHtml(Number(qty).toLocaleString(undefined,{maximumSignificantDigits:8}))}</td></tr>`)
-  ]) : '<div class="manager-empty"><strong>Build your first paper portfolio</strong><p>Choose assets and a virtual starting balance, run historical research, then start paper trading. Exchange credentials are not needed.</p></div>';
+  ]) : '<div class="manager-empty"><strong>Build your first paper portfolio</strong><p>Choose assets, a virtual starting balance, and a paper signal model.</p></div>';
   const status = data.research_status || {};
   const research = data.research;
   const researchBadge = document.getElementById('managerResearchBadge');
@@ -4564,11 +4615,6 @@ function renderPortfolioManager(data) {
     `<details class="manager-details"><summary>Validation checks and data coverage</summary>${managedTable(['Validation criterion','Result'],Object.entries(research.validation_outcome?.checks || {}).map(([name,passed]) => `<tr><td>${escHtml(checkLabels[name] || name.replaceAll('_',' '))}</td><td style="color:var(--${passed ? 'green' : 'yellow'})">${passed ? 'Passed' : 'Not met'}</td></tr>`))}<p class="portfolio-note">Validation-period returns: ${folds.map(f => portfolioPercent(f.return_pct)).join(', ') || 'Unavailable'}. Forecast mean absolute error: ${Object.entries(research.forecast_quality || {}).map(([h,q]) => `${escHtml(h)}h: ${Number(q.return_mae_bps).toFixed(1)} basis points`).join('; ') || 'Unavailable'}.</p>${managedTable(['Asset','Data coverage'],Object.entries(research.data_quality || {}).map(([asset,audit]) => `<tr><td>${escHtml(asset)}</td><td>${audit.eligible ? 'Eligible' : 'Excluded: ' + escHtml(audit.reason || 'Insufficient valid history')}</td></tr>`))}<p class="portfolio-note"><a href="/api/portfolio-manager/research/report" target="_blank" rel="noopener">Inspect full report, source audits and fills</a> · <a href="/api/portfolio-manager/research/experiments" target="_blank" rel="noopener">Prior runs (JSON)</a></p></details>` : '';
   const detailsPane = document.getElementById('managerResearchDetails');
   if (detailsPane._managerMarkup !== researchMarkup) { detailsPane.innerHTML = researchMarkup; detailsPane._managerMarkup = researchMarkup; }
-  const model = data.model_status;
-  const uncovered = model?.assets?.length ? selectedManagedAssets().filter(asset => !model.assets.includes(asset)) : model?.missing_paper_assets || [];
-  document.getElementById('managerModelNote').textContent = ready
-    ? 'Model ready' + (model?.method ? ': ' + model.method : '') + '. ' + (uncovered.length ? 'No trained model for ' + uncovered.join(', ') + '; these assets are skipped.' : 'Paper trading uses the saved model and public prices.')
-    : model?.reason || 'Complete research for your selected assets to enable paper trading.';
   document.getElementById('managerObservation').textContent = paper ? 'Last observation: ' + (paper.last_observation_at ? portfolioDate(paper.last_observation_at) : 'Waiting for the first hourly observation') + (latest?.at ? '. Last ' + (incomplete ? 'valuation attempt: ' : 'complete valuation: ') + portfolioDate(latest.at) : '') + (incomplete ? '. Missing prices: ' + (latest.unpriced || []).join(', ') + '. Equity and return are unavailable.' : '') : '';
   document.getElementById('managerDecisions').innerHTML = (paper?.decisions || []).slice(-8).reverse().map(decision =>
     `<div class="manager-decision"><time>${escHtml(portfolioDate(decision.at))}</time>${escHtml(decision.reason || 'No decision reason recorded.')}</div>`).join('') || '<p class="portfolio-note">No decisions yet. After starting, the model evaluates each four-hour boundary.</p>';
@@ -4625,6 +4671,7 @@ async function managedAction(path, payload, successMessage = 'Portfolio manager 
       document.getElementById('managerAssets').innerHTML = '';
       document.getElementById('managerBudget').value = '200';
       document.getElementById('managerDays').value = '365';
+      document.getElementById('managerSignalModel').value = 'research';
       if (managerData) managerData = {...managerData,research_status:result.research_status ?? null};
       if (result.research_status?.status === 'running') successMessage += ' Current research is still running; its results will appear when it finishes.';
     }
@@ -4650,7 +4697,7 @@ async function startManagedPaper() {
   return sessionLifecycle.run(async requestOwner => {
   try {
     const payload = managerSetupPayload();
-    if (!managerModelReady()) throw new Error('Run research for your selected assets before starting paper trading.');
+    if (!managerModelReady()) throw new Error(document.getElementById('managerModelNote').textContent || 'The selected signal model is unavailable.');
     await sessionLifecycle.wait(requestOwner, (managedAction('/api/portfolio-manager/paper/start',payload,managerData?.paper ? 'Paper trading resumed' : 'Paper trading started')));
   } catch (error) { if (!sessionLifecycle.isCurrent(requestOwner) || sessionLifecycle.isStale(error)) throw sessionLifecycle.changed();  managedSetupError(error); }
 

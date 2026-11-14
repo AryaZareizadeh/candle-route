@@ -12,6 +12,7 @@ import stat
 import tempfile
 import zipfile
 
+from forecast_storage import forecast_artifacts, forecast_workspace
 from runtime_lease import FileLease
 
 FORMAT_VERSION = 1
@@ -95,10 +96,14 @@ def backup_bundle(source, output):
         # Freeze candidate paths before staging, which may be inside the source
         # volume when the operator stores its bundle under data/backups.
         candidates = list(source.rglob('*'))
+        workspaces = {forecast_workspace(database.parent) for database in databases if database.name == 'trader.sqlite3'}
+        workspaces.add(forecast_workspace(source))
+        workspaces.update(path for path in (source / 'users').glob('*/forecasting') if path.is_dir())
+        forecasts = {path for workspace in workspaces if workspace.is_dir() for path in forecast_artifacts(workspace)}
         staging = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='.bundle-', dir=output.parent)))
         data = staging / 'data'
         data.mkdir()
-        for path in candidates:
+        for path in sorted({*candidates, *forecasts}):
             if not path.is_file():
                 continue
             relative = path.relative_to(source)
@@ -106,7 +111,11 @@ def backup_bundle(source, output):
             database = path.suffix == '.sqlite3'
             artifact = ('models' in relative.parts and path.suffix in {'.pt', '.joblib'}) or (
                 path.name.startswith('spot_') and (path.suffix in {'.joblib', '.json'} or path.name.endswith('.json.gz')))
-            if not (database or artifact):
+            if any(path.is_relative_to(workspace) for workspace in workspaces):
+                if path not in forecasts:
+                    continue
+                database = False
+            elif not (database or artifact):
                 continue
             if path.is_symlink() or not path.resolve().is_relative_to(source):
                 raise ValueError('Runtime artifact path escapes its directory')

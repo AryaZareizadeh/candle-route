@@ -10,7 +10,7 @@
     if (hours < 24) return `${number(hours, 2)} ${hours === 1 ? "hour" : "hours"}`;
     return `${number(days, 2)} ${days === 1 ? "day" : "days"}`;
   }
-  const state = { token: null, models: [], jobs: [], tokenizers: [], savedRuns: [], savedRunsSupported: false, removingRun: null, separateStagesSupported: false, selectedJob: null, busy: false, timer: null, online: false, logSignature: "", pollCount: 0, submittedDecision: null, seenDecisions: new Set() };
+  const state = { token: null, settingsScope: null, models: [], jobs: [], tokenizers: [], savedRuns: [], savedRunsSupported: false, removingRun: null, separateStagesSupported: false, selectedJob: null, busy: false, timer: null, online: false, logSignature: "", pollCount: 0, submittedDecision: null, seenDecisions: new Set() };
   const active = (job) => job && ["queued", "running", "awaiting_decision"].includes(job.status);
   const waiting = (job) => job?.status === "awaiting_decision" && Boolean(job.pending_decision);
   const decisionKey = (job) => waiting(job) ? `${job.id}:${job.pending_decision.decision_id}` : null;
@@ -37,14 +37,22 @@
   const isKronos = (model) => ["kronos-small", "kronos-base"].includes(model);
   const tokenizerDataFields = ["start", "end", "lookback", "train_fraction", "validation_fraction", "kronos_timeframe", "kronos_prediction_length", "kronos_train_stride", "kronos_eval_stride"];
   const formStorageKey = "crypto-forecast.training-settings.v2";
+  function workspaceStorageKey(key) {
+    return state.settingsScope ? `${key}.${state.settingsScope}` : key;
+  }
+  function applySession(bootstrap) {
+    state.token = bootstrap.csrf_token;
+    state.settingsScope = bootstrap.settings_scope || null;
+  }
   let restoredTokenizerId = "";
   function saveFormSettings() {
+    if (window.ForecastConnection.accountWorkspace && !state.settingsScope) return;
     const fields = Array.from($("training-form").querySelectorAll("input[id]:not([type=checkbox]), select[id]"));
-    try { localStorage.setItem(formStorageKey, JSON.stringify({ values: Object.fromEntries(fields.filter((field) => field.id !== "extra-coins").map((field) => [field.id, field.value])), profiles: trainingProfiles })); } catch (_) { /* Training remains available without storage. */ }
+    try { localStorage.setItem(workspaceStorageKey(formStorageKey), JSON.stringify({ values: Object.fromEntries(fields.filter((field) => field.id !== "extra-coins").map((field) => [field.id, field.value])), profiles: trainingProfiles })); } catch (_) { /* Training remains available without storage. */ }
   }
   function restoreFormSettings() {
     try {
-      const saved = JSON.parse(localStorage.getItem(formStorageKey));
+      const saved = JSON.parse(localStorage.getItem(workspaceStorageKey(formStorageKey)));
       if (!saved?.values) return;
       for (const [id, value] of Object.entries(saved.values)) {
         const field = $(id);
@@ -127,8 +135,9 @@
   }
   function saveCoinChoices() {
     organizeCoinChoices();
+    if (window.ForecastConnection.accountWorkspace && !state.settingsScope) return;
     const inputs = Array.from($("coin-picks").querySelectorAll("input"));
-    try { localStorage.setItem(coinStorageKey, JSON.stringify({ coins: inputs.map((input) => input.value), selected: inputs.filter((input) => input.checked).map((input) => input.value), removed: [...removedCoins] })); } catch (_) { /* Coin controls still work when browser storage is unavailable. */ }
+    try { localStorage.setItem(workspaceStorageKey(coinStorageKey), JSON.stringify({ coins: inputs.map((input) => input.value), selected: inputs.filter((input) => input.checked).map((input) => input.value), removed: [...removedCoins] })); } catch (_) { /* Coin controls still work when browser storage is unavailable. */ }
   }
   function updateCoinSelection() {
     const inputs = Array.from($("coin-picks").querySelectorAll("input")), selected = inputs.filter((input) => input.checked).length;
@@ -155,7 +164,7 @@
   }
   function restoreCoinChoices(bootstrap, persist = true) {
     let saved = null;
-    try { saved = JSON.parse(localStorage.getItem(coinStorageKey)); } catch (_) { /* Ignore unavailable storage or an invalid saved selection. */ }
+    try { saved = JSON.parse(localStorage.getItem(workspaceStorageKey(coinStorageKey))); } catch (_) { /* Ignore unavailable storage or an invalid saved selection. */ }
     if (saved && Array.isArray(saved.removed)) removedCoins = new Set(saved.removed.filter(validCoin));
     for (const input of $("coin-picks").querySelectorAll("input")) {
       if (removedCoins.has(input.value)) input.closest("label").remove();
@@ -217,21 +226,14 @@
   function connection(online) {
     state.online = online;
     $("connection").className = `connection ${online ? "online" : "offline"}`;
-    $("connection-text").textContent = online ? "Local server connected" : "Connection lost · retrying";
+    $("connection-text").textContent = online ? "Connected" : "Forecasting unavailable";
     updateActions();
   }
   async function api(url, options = {}) {
-    const headers = { Accept: "application/json", ...(options.headers || {}) };
-    if (options.body) { headers["Content-Type"] = "application/json"; headers["X-CSRF-Token"] = state.token; }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12000);
-    let response;
-    try { response = await fetch(url, { ...options, headers, signal: controller.signal, credentials: "same-origin", cache: "no-store" }); }
+    try { return await window.ForecastConnection.api(url, {...options, signal: controller.signal}, state.token); }
     finally { clearTimeout(timeout); }
-    let data;
-    try { data = await response.json(); } catch (_) { throw new Error(`The server returned an unreadable response (${response.status}).`); }
-    if (!response.ok) throw new Error(data.error?.message || data.error || data.message || `Request failed (${response.status}).`);
-    return data;
   }
   function applyDefaults(defaults = {}) {
     for (const id of [...schedulerFields, ...schedulerFields.map((field) => "kronos_tokenizer_" + field), "start", "end", "model_type", "lookback", "hidden_size", "epochs", "patience", "batch_size", "learning_rate", "device", "seed", "train_fraction", "validation_fraction", "kronos_timeframe", "kronos_prediction_length", "kronos_sample_count", "kronos_eval_stride", "kronos_train_stride", "kronos_preparation_workers", "kronos_finetune_tokenizer", "kronos_tokenizer_epochs", "kronos_tokenizer_patience", "kronos_tokenizer_learning_rate", "kronos_tokenizer_batch_size"]) {
@@ -735,12 +737,12 @@
     try {
       if (!state.online && state.token) {
         const recovered = await api("/api/bootstrap");
-        state.token = recovered.csrf_token; applyModelOptions(recovered.models); applyTokenizerBootstrap(recovered); renderCoverage(recovered.data); discoverCoinChoices(recovered); renderArchitecture();
+        applySession(recovered); applyModelOptions(recovered.models); applyTokenizerBootstrap(recovered); renderCoverage(recovered.data); discoverCoinChoices(recovered); renderArchitecture();
         state.savedRunsSupported = Array.isArray(recovered.saved_runs); renderSavedRuns(recovered.saved_runs || []);
       }
       if (!state.token) {
         const bootstrap = await api("/api/bootstrap");
-        state.token = bootstrap.csrf_token; applyModelOptions(bootstrap.models); applyDefaults(bootstrap.defaults); restoreFormSettings(); applyTokenizerBootstrap(bootstrap); restoreCoinChoices(bootstrap); renderCoverage(bootstrap.data); renderArchitecture();
+        applySession(bootstrap); applyModelOptions(bootstrap.models); applyDefaults(bootstrap.defaults); restoreFormSettings(); applyTokenizerBootstrap(bootstrap); restoreCoinChoices(bootstrap); renderCoverage(bootstrap.data); renderArchitecture();
         state.jobs = bootstrap.jobs || [];
         state.savedRunsSupported = Array.isArray(bootstrap.saved_runs); renderSavedRuns(bootstrap.saved_runs || []);
         state.selectedJob = state.jobs.find((job) => job.operation !== "forecast" && active(job))?.id || state.jobs.find((job) => job.operation !== "forecast")?.id || null;
@@ -756,13 +758,13 @@
         if (state.savedRunsSupported) { const saved = await api("/api/saved-runs"); renderSavedRuns(saved.saved_runs || []); }
         if (justFinished?.operation === "download") { const fresh = await api("/api/bootstrap"); renderCoverage(fresh.data); discoverCoinChoices(fresh); renderArchitecture(); }
       }
-    } catch (error) { connection(false); showError("page-error", `Unable to reach the local server. Keep the dashboard server running. ${error.message}`); }
+    } catch (error) { connection(false); showError("page-error", error.message); }
     finally { schedulePoll(state.jobs.some(active) ? 1500 : 3000); }
   }
   async function initialize() {
-    restoreCoinChoices({}, false); renderChart(); updateActions();
+    organizeCoinChoices(); renderChart(); updateActions();
     try {
-      const bootstrap = await api("/api/bootstrap"); state.token = bootstrap.csrf_token; applyModelOptions(bootstrap.models); applyDefaults(bootstrap.defaults); restoreFormSettings(); applyTokenizerBootstrap(bootstrap); restoreCoinChoices(bootstrap); renderCoverage(bootstrap.data); renderArchitecture();
+      const bootstrap = await api("/api/bootstrap"); applySession(bootstrap); applyModelOptions(bootstrap.models); applyDefaults(bootstrap.defaults); restoreFormSettings(); applyTokenizerBootstrap(bootstrap); restoreCoinChoices(bootstrap); renderCoverage(bootstrap.data); renderArchitecture();
       $("hardware-note").textContent = bootstrap.hardware?.cuda_available === true ? "CUDA GPU available. Automatic will use the GPU." : bootstrap.hardware?.cuda_available === false ? "CPU training available. No CUDA GPU was detected." : "Automatic checks GPU availability when training starts.";
       state.jobs = bootstrap.jobs || [];
       state.savedRunsSupported = Array.isArray(bootstrap.saved_runs); renderSavedRuns(bootstrap.saved_runs || []);

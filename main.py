@@ -11,14 +11,48 @@ def main(argv=None):
 
     load_environment()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("serve", "setup-password", "backup", "backup-bundle", "verify-bundle", "restore-bundle", "import-legacy"), default="serve")
+    parser.add_argument("command", nargs="?", choices=("serve", "setup-password", "backup", "backup-bundle", "verify-bundle", "restore-bundle", "import-legacy", "import-forecasting", "setup-kronos"), default="serve")
     parser.add_argument("--output", type=Path, help="New database or bundle backup file")
-    parser.add_argument("--username", help="Verified destination account for import-legacy")
+    parser.add_argument("--username", help="Verified destination account for a data import or model setup")
     parser.add_argument("--source", type=Path, help="Backup bundle or legacy SQLite database")
     parser.add_argument("--destination", type=Path, help="Empty directory for restore-bundle")
+    parser.add_argument("--model", choices=("kronos-small", "kronos-base"), help="Original weights for setup-kronos")
+    parser.add_argument("--exclude-run", action="append", default=[], help="Saved run directory to omit from import-forecasting")
     parser.add_argument("--host", default=os.getenv("TRADER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("TRADER_PORT", "8011")))
     args = parser.parse_args(argv)
+    if args.model is not None and args.command != "setup-kronos":
+        parser.error("--model is only valid with setup-kronos")
+    if args.exclude_run and args.command != "import-forecasting":
+        parser.error("--exclude-run is only valid with import-forecasting")
+    if args.command in ("import-forecasting", "setup-kronos"):
+        from forecast_storage import account_dir, forecast_workspace, import_forecasting
+        from runtime_lease import FileLease
+        from settings import data_dir
+
+        if args.output is not None or args.destination is not None:
+            parser.error("Forecasting setup uses the configured CandleRoute data directory")
+        root = data_dir()
+        if (root / "accounts.sqlite3").exists() and not args.username:
+            parser.error("--username is required for a multi-user runtime")
+        try:
+            if args.command == "import-forecasting":
+                if args.source is None:
+                    parser.error("import-forecasting requires --source PATH")
+                target, count = import_forecasting(args.source, root, args.username, exclude_runs=args.exclude_run)
+                print(f"Imported {count} forecasting files to {target}.")
+            else:
+                if args.source is not None:
+                    parser.error("--source is only valid with import-forecasting")
+                from forecasting.crypto_forecast.kronos_setup import download_pretrained
+
+                model = args.model or "kronos-small"
+                with FileLease(root / ".dashboard.lock"):
+                    workspace = forecast_workspace(account_dir(root, args.username))
+                    download_pretrained(workspace / "models" / model, model=model)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        return
     if args.command in ("backup-bundle", "verify-bundle", "restore-bundle"):
         from backup import backup_bundle, restore_bundle, verify_bundle
         from settings import data_dir

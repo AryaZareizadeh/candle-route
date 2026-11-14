@@ -66,11 +66,8 @@
   });
   function error(message = "") { $("chart-error").textContent = message; $("chart-error").hidden = !message; }
   async function api(path, value) {
-    const response = await fetch(path, value === undefined ? {} : {method: "POST",
-      headers: {"Content-Type": "application/json", "X-CSRF-Token": state.token}, body: JSON.stringify(value)});
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.error || "The local server could not complete this request.");
-    return body;
+    const options = value === undefined ? {} : {method: "POST", body: JSON.stringify(value)};
+    return window.ForecastConnection.api(path, options, state.token);
   }
   function settings() {
     const window = forecastWindow(Number($("chart-duration").value), $("chart-duration-unit").value, $("chart-timeframe").value);
@@ -158,7 +155,7 @@
       }
       return row;
     }));
-    $("chart-json").href = "/api/chart/forecasts/" + encodeURIComponent(state.selected);
+    $("chart-json").href = window.ForecastConnection.path("/api/chart/forecasts/" + encodeURIComponent(state.selected));
   }
   function renderJobs() {
     const jobs = state.jobs.filter((job) => job.operation === "forecast" && job.mode !== "testing"), select = $("chart-job-select");

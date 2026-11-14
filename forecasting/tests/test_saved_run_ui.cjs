@@ -44,6 +44,7 @@ function dashboard({ confirm = true, bootstrap = {}, deletionError = null } = {}
           : bootstrap };
     },
   });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../crypto_forecast/web/connection.js"), "utf8"), context);
   vm.runInContext(`${prefix}
     renderChart = () => {};
     renderLogs = () => {};
@@ -106,12 +107,12 @@ test("confirmed removal uses CSRF JSON and refreshes inventories and job history
   field("kronos_tokenizer_run_id").value = "saved-run";
   await ui.removeSavedRun("saved-run");
   assert.equal(confirmations.length, 1);
-  assert.equal(calls[0].url, "/api/runs/saved-run/delete");
+  assert.equal(calls[0].url, "./api/runs/saved-run/delete");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.headers["X-CSRF-Token"], "csrf-token");
   assert.equal(calls[0].options.headers["Content-Type"], "application/json");
   assert.equal(calls[0].options.body, "{}");
-  assert.equal(calls[1].url, "/api/bootstrap");
+  assert.equal(calls[1].url, "./api/bootstrap");
   assert.equal(ui.state.savedRuns.length, 0);
   assert.equal(ui.state.tokenizers.length, 0);
   assert.equal(ui.state.jobs[0].artifacts_removed_at, "2026-10-23T00:00:00Z");

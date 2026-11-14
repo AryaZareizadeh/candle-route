@@ -23,6 +23,7 @@ RUN --mount=type=cache,id=nobitex-training-pip,target=/root/.cache/pip,sharing=l
     elif [ "$TRAINER_DEVICE" = cpu ]; then pip install --retries 10 --timeout 60 torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu; \
     elif [ "$TRAINER_DEVICE" != none ]; then echo "TRAINER_DEVICE must be none, cuda or cpu" >&2; exit 1; fi
 COPY --chown=trader:trader . .
+RUN if [ "$TRAINER_DEVICE" != none ]; then pip install --no-cache-dir -c requirements-lock.txt './forecasting[kronos]'; fi
 USER trader
 EXPOSE 8011
 VOLUME ["/data"]

@@ -9,11 +9,8 @@
   const number = (value) => value == null ? "—" : Number(value).toLocaleString("en-US", {maximumFractionDigits: 6});
   function error(message = "") { $("error").textContent = message; $("error").hidden = !message; }
   async function api(path, value) {
-    const response = await fetch(path, value === undefined ? {} : {method: "POST",
-      headers: {"Content-Type": "application/json", "X-CSRF-Token": state.token}, body: JSON.stringify(value)});
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.error || "The local server could not complete this request.");
-    return body;
+    const options = value === undefined ? {} : {method: "POST", body: JSON.stringify(value)};
+    return window.ForecastConnection.api(path, options, state.token);
   }
   function settings() {
     return {coin: $("coin").value, timeframe: $("timeframe").value, model: $("model").value,
@@ -124,7 +121,7 @@
         count: result.history.length}}; draw(true);
     $("result").hidden = false;
     $("result-model").textContent = `${result.model_label} · ${result.device} · ${result.settings.lookback} input candles · ${result.settings.horizon} predictions`;
-    $("json").href = "/api/chart/forecasts/" + encodeURIComponent(state.selected);
+    $("json").href = window.ForecastConnection.path("/api/chart/forecasts/" + encodeURIComponent(state.selected));
     const actual = new Map((result.actual || []).map((candle) => [Date.parse(candle.timestamp), candle]));
     const matched = result.forecast.filter((candle) => actual.has(Date.parse(candle.timestamp))).length;
     $("comparison-note").textContent = `Forecast starts ${utc(result.origin)}. ${matched} of ${result.forecast.length} predictions have observed candles for comparison. Missing observations appear as —. Only the ${result.settings.lookback} candles ending at the selected point were supplied to the model. ${result.amount_note}`;

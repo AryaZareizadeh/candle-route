@@ -15,8 +15,12 @@ function dashboard(fetch) {
   const element = id => {
     if (!elements.has(id)) {
       const classes = new Set();
+      const attributes = new Map();
       elements.set(id, {id,value:'',textContent:'',innerHTML:'',style:{},dataset:{},options:[],hidden:false,
         classList:{add: name => classes.add(name),remove:name => classes.delete(name),contains:name => classes.has(name)},
+        contentWindow: id === 'forecastingFrame' ? {} : null,
+        setAttribute: (name, value) => attributes.set(name, value), getAttribute: name => attributes.get(name) ?? null,
+        removeAttribute: name => attributes.delete(name),
         focus() {}, addEventListener() {}, querySelectorAll:() => []});
     }
     return elements.get(id);
@@ -24,14 +28,16 @@ function dashboard(fetch) {
   const document = {getElementById:element,addEventListener() {},
     querySelector:() => ({classList:{add() {},remove() {}}}),
     querySelectorAll:selector => selector === '.modal-overlay' ? [element('historyModal'),element('settingsModal')] : []};
-  const context = vm.createContext({document,window:{fetch},console,Date,AbortController,Headers,Response,
+  const listeners = new Map();
+  const context = vm.createContext({document,window:{fetch,location:{origin:'http://testserver'},
+    addEventListener:(type, handler) => listeners.set(type, handler)},console,Date,AbortController,Headers,Response,
     setTimeout(callback,delay) {const id=++nextTimer;timers.set(id,{callback,delay});return id;},
     clearTimeout:id => timers.delete(id),setInterval:() => 0,clearInterval() {}});
   if (fs.existsSync(modulePath)) vm.runInContext(fs.readFileSync(modulePath,'utf8'), context);
   vm.runInContext(script, context);
   const run = code => vm.runInContext(code, context);
   run("authenticated=true; csrfToken='account-A'; showToast=() => {}; var originalConnectWS=connectWS; connectWS=() => {}; loadMarginMarkets=async () => {}; ");
-  return {element,run,context,timers};
+  return {element,run,context,timers,listeners};
 }
 
 test('visible bot chart refreshes once per candle and preserves viewport', async () => {
@@ -185,6 +191,35 @@ test('successful login reloads the active private view', async () => {
   page.run('loadedViews=[]');
   await page.run('signIn({preventDefault(){}})');
   assert.deepEqual(Array.from(page.run('loadedViews')),['PortfolioManager']);
+});
+
+test('forecasting opens under the same dashboard and removes the old frame on sign-out', async () => {
+  const page = dashboard(async () => new Response(JSON.stringify({authenticated:true,csrf_token:'account-B'})));
+  assert.match(html, /data-view="Forecasting"[^>]*>Forecasting<\/button>/);
+  assert.match(html, /<iframe id="forecastingFrame" title="Forecasting workspace"><\/iframe>/);
+  const frame = page.element('forecastingFrame');
+  assert.equal(frame.getAttribute('src'), null);
+  page.run("switchView('Forecasting')");
+  assert.equal(frame.getAttribute('src'), '/forecasting/');
+  assert.equal(page.run("forecastingParentToken(document.getElementById('forecastingFrame'))"), 'account-A');
+  assert.equal(page.run('forecastingParentToken({})'), null);
+  page.run("showLogin(); switchView('Forecasting'); fetchWallet=async () => {}");
+  assert.equal(frame.getAttribute('src'), null);
+  assert.equal(page.run("forecastingParentToken(document.getElementById('forecastingFrame'))"), null);
+  await page.run('signIn({preventDefault(){}})');
+  assert.equal(frame.getAttribute('src'), '/forecasting/');
+});
+
+test('forecasting authentication failures only affect the current frame on the dashboard origin', () => {
+  const page = dashboard(async () => new Response('{}'));
+  page.run("switchView('Forecasting')");
+  const {contentWindow:source} = page.element('forecastingFrame');
+  const receive = page.listeners.get('message');
+  receive({origin:'http://outside.test',source,data:'forecasting-session-ended'});
+  receive({origin:'http://testserver',source:{},data:'forecasting-session-ended'});
+  assert.equal(page.run('authenticated'), true);
+  receive({origin:'http://testserver',source,data:'forecasting-session-ended'});
+  assert.equal(page.run('authenticated'), false);
 });
 
 test('a replaced websocket cannot render old financial state', () => {

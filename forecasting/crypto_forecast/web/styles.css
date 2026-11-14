@@ -49,3 +49,12 @@
 .download-coin-row.failed .download-coin-track>span{background:var(--red)}
 @media(prefers-reduced-motion:reduce){.download-coin-track.indeterminate>span{animation:none}}
 .saved-runs-panel{padding:24px 27px}.saved-runs-panel>.section-heading{margin-bottom:12px}.saved-run-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 0;border-bottom:1px solid var(--line)}.saved-run-row:last-child{border-bottom:0}.saved-run-row>div{min-width:0}.saved-run-row strong{font-size:12px;overflow-wrap:anywhere}.saved-run-row p{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.6}.saved-run-row button{flex:none}#saved-runs-feedback:empty{display:none}
+
+.embedded-workspace .app-header {
+  height: auto;
+  min-height: 32px;
+  justify-content: flex-end;
+  padding: 6px clamp(16px, 3vw, 38px);
+}
+.embedded-workspace .app-header .brand { display: none; }
+.embedded-workspace main { padding-top: 18px; }

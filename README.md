@@ -1,16 +1,13 @@
 # CandleRoute
 
-CandleRoute brings together crypto forecasting, strategy research, portfolio tracking,
-and Nobitex trading in one repository.
+CandleRoute is one dashboard for crypto forecasting, strategy research, portfolio
+tracking, paper trading, and Nobitex margin execution. Sign in once to use **Forecasting**,
+**Portfolio Manager**, and **Bots**. The Forecasting tab includes Kronos chart forecasts,
+model testing, candle downloads, and Kronos, GRU, and LSTM training.
 
-- **Trading dashboard (`/`)** supports backtesting, paper trading, and live margin
-  execution on Nobitex. Follow the setup below to run it.
-- **Forecasting (`forecasting/`)** runs the Kronos, GRU, and LSTM research tools and
-  dashboard. Follow the [forecasting setup](forecasting/README.md) from that directory.
-
-The forecasting dashboard currently runs separately. The next integration milestone
-is to make Kronos forecasts available to portfolio research and paper trading in the
-trading dashboard.
+In **Portfolio Manager**, choose **Kronos-small** to use four-hour price forecasts
+from completed hourly candles in the paper allocator. The original portfolio research
+model remains the default. Kronos paper positions are simulated with public market data.
 
 ## Trading dashboard
 
@@ -46,6 +43,11 @@ Put the generated value in `TRADER_MASTER_KEY` in `docker.env`. Set a long rando
 docker compose up --build -d
 docker compose ps
 ```
+
+The default image includes CPU forecasting. For CUDA, add `-f compose.yaml -f compose.cuda.yaml`
+to the Compose command. To provision original weights for a verified account, stop the
+dashboard and run `docker compose run --rm --no-deps dashboard python main.py setup-kronos --username USERNAME`.
+Then start the dashboard again. Add `--model kronos-base` for the larger forecasting model.
 
 After updating the source, back up `trader_data` and `docker.env` as described
 under [operations](docs/operations.md), then run
@@ -86,6 +88,8 @@ PowerShell:
 ```powershell
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -c requirements-lock.txt
+.\.venv\Scripts\python.exe -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+.\.venv\Scripts\python.exe -m pip install -e './forecasting[kronos]' -c requirements-lock.txt
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe main.py setup-password
 .\.venv\Scripts\python.exe main.py
@@ -100,6 +104,27 @@ changing the password. No password is preconfigured.
 The launcher runs one process, without automatic reload. `--host` and `--port`
 override the default loopback address and port. Use the remote deployment
 instructions before exposing the service beyond your own computer.
+
+On a fresh workspace, stop the dashboard and run
+`.\.venv\Scripts\python.exe main.py setup-kronos` to download original Kronos-small
+weights. Add `--model kronos-base` to provision that variant. In **Forecasting**,
+download candle history or upload CSV data in the chart view.
+
+### Bring over an existing forecasting workspace
+
+Stop both dashboards. From CandleRoute, run the following command with the path
+to the former Portfolio Manager directory:
+
+```powershell
+.\.venv\Scripts\python.exe main.py import-forecasting --source 'D:\GitHub\portfolio-manager'
+```
+
+For a multi-user deployment, run the same command with `--username USERNAME`
+against the stopped CandleRoute volume and a mounted copy of the old workspace.
+The command copies saved candles, original weights, checkpoints, and job history
+into the account's empty `forecasting/` runtime folder. For Docker, keep using the
+existing Compose project name and data volume when moving the deployment to a new
+directory. See [Operations](docs/operations.md).
 
 ## First use
 

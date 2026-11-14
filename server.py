@@ -36,6 +36,8 @@ from runtime_lease import FileLease
 from runtime_status import status_router
 from trainer_routes import trainer_router
 from market_quotes import shared_market_quotes
+from forecast_routes import ForecastWorkspace, forecast_router
+from forecast_storage import forecast_workspace
 
 # ── REST Models ────────────────────────────────────────────────────────────────
 class CreateBotRequest(BaseModel):
@@ -160,6 +162,7 @@ class PortfolioTargetsRequest(BaseModel):
 class SpotPaperStartRequest(BaseModel):
     assets: Optional[list[str]] = None
     budget_usdt: float = Field(default=200, gt=0, le=100000)
+    signal_model: Literal["research", "kronos-small"] | None = None
 
 
 class SpotResearchRequest(BaseModel):
@@ -193,7 +196,9 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
         offline = os.getenv("TRADER_OFFLINE", "false").lower() == "true"
     bot_manager = manager or BotManager(legacy_dir=data_dir() if os.getenv("TRADER_DATA_DIR") else None)
     portfolio_history = PortfolioHistory(bot_manager.store)
-    spot_paper = SpotPaperService(bot_manager.store)
+    forecast_dir = forecast_workspace(bot_manager.store.path.parent)
+    forecasts = ForecastWorkspace(forecast_dir, offline=offline)
+    spot_paper = SpotPaperService(bot_manager.store, forecast_workspace=forecast_dir, offline=offline)
     spot_research_task = None
     tester_manager = TesterManager(store=manager.store if manager is not None else None)
     optimizer_manager = OptimizerManager(store=manager.store if manager is not None else None)
@@ -467,8 +472,11 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
                 await optimizer_manager.shutdown()
                 await model_trainer.shutdown()
             finally:
-                store.release_runtime()
-                dashboard_lease.release()
+                try:
+                    await asyncio.to_thread(forecasts.shutdown)
+                finally:
+                    store.release_runtime()
+                    dashboard_lease.release()
 
 
     # ── App ────────────────────────────────────────────────────────────────────────
@@ -489,6 +497,7 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
 
     app.include_router(trainer_router(model_trainer, ModelTrainingRequest))
     app.include_router(status_router(bot_manager, _exchange_state, model_trainer))
+    app.include_router(forecast_router(forecasts))
 
 
     # ── WebSocket ──────────────────────────────────────────────────────────────────
@@ -745,6 +754,7 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
         report = bot_manager.store.get("spot_manager", "research")
         return {"ok": True, "approved_assets": list(APPROVED_ASSETS),
                 "model_status": await asyncio.to_thread(spot_paper.model_status),
+                "kronos_status": await asyncio.to_thread(spot_paper.kronos_status),
                 "paper": state, "paper_error": bot_manager.store.get("spot_manager", "paper_error"),
                 "research_status": _spot_research_status(),
                 "research": {"run_id": report.get("run_id"), "selected": report["selected"], "windows": report["windows"],
@@ -784,7 +794,10 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
     @app.post("/api/portfolio-manager/paper/start")
     async def start_spot_paper(request: SpotPaperStartRequest):
         try:
-            return {"ok": True, "paper": spot_paper.start(request.assets, request.budget_usdt)}
+            paper = await asyncio.to_thread(
+                spot_paper.start, request.assets, request.budget_usdt, signal_model=request.signal_model,
+            )
+            return {"ok": True, "paper": paper}
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 

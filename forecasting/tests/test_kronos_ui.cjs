@@ -31,16 +31,17 @@ const context = vm.createContext({
     createElement: (tag) => field("new-" + tag) },
   localStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
   Option: function(text, value) { this.text = text; this.value = value; },
-  console, AbortController, setTimeout: () => 1, clearTimeout() {},
+  window: {}, console, AbortController, setTimeout: () => 1, clearTimeout() {},
   fetch: (...args) => context.fetchResponse(...args),
 });
+vm.runInContext(fs.readFileSync(path.join(__dirname, "../crypto_forecast/web/connection.js"), "utf8"), context);
 let source = fs.readFileSync(path.join(__dirname, "../crypto_forecast/web/app.js"), "utf8");
 source = source.slice(0, source.indexOf('  $("training-form").addEventListener("submit"'));
 source += `
   renderChart = (history) => { state.testChartHistory = history; };
   renderLogs = () => {};
   globalThis.ui = { state, applyDefaults, changeModel, syncModelControls, syncSchedulers,
-    useTokenizerSettings, configFromForm, saveFormSettings, restoreFormSettings,
+    useTokenizerSettings, configFromForm, saveFormSettings, restoreFormSettings, applySession,
     applyTokenizerBootstrap, renderMonitor, setCoinSelection, organizeCoinChoices, downloadCoinView,
     initialize, poll, renderJobs,
     disableArchitecturePreview() { renderArchitecture = () => {}; } };
@@ -133,6 +134,27 @@ assert.equal(field("coin-selection-count").textContent, "2 of 2 selected");
 assert.equal(field("select-all-coins").disabled, true);
 assert.equal(field("clear-coins").disabled, false);
 assert.deepEqual(JSON.parse(storage.get("crypto-forecast.coin-choices.v1")).selected, ["BTC", "ETH"]);
+context.window.ForecastConnection.accountWorkspace = true;
+const publicDraft = storage.get("crypto-forecast.training-settings.v2");
+field("batch_size").value = "10";
+ui.saveFormSettings();
+assert.equal(storage.get("crypto-forecast.training-settings.v2"), publicDraft);
+ui.applySession({ csrf_token: "token-a", settings_scope: "account-a" });
+ui.saveFormSettings();
+ui.setCoinSelection(true);
+ui.applySession({ csrf_token: "token-b", settings_scope: "account-b" });
+field("batch_size").value = "12";
+ui.restoreFormSettings();
+assert.equal(field("batch_size").value, "12");
+ui.saveFormSettings();
+ui.setCoinSelection(false);
+assert.deepEqual(JSON.parse(storage.get("crypto-forecast.coin-choices.v1.account-a")).selected, ["BTC", "ETH"]);
+assert.deepEqual(JSON.parse(storage.get("crypto-forecast.coin-choices.v1.account-b")).selected, []);
+ui.applySession({ csrf_token: "token-a", settings_scope: "account-a" });
+ui.restoreFormSettings();
+assert.equal(field("batch_size").value, "10");
+context.window.ForecastConnection.accountWorkspace = false;
+ui.applySession({});
 ui.setCoinSelection(false);
 assert.ok(coins.every((coin) => !coin.checked));
 assert.equal(field("coin-selection-count").textContent, "0 of 2 selected");
@@ -177,8 +199,8 @@ async function checkTrainingWorkspace() {
   let jobs = [completed];
   context.fetchResponse = async (url) => {
     requests.push(url);
-    const value = url === "/api/bootstrap" ? bootstrap : url === "/api/jobs" ? { jobs } :
-      url === "/api/tokenizers" ? { tokenizers: [{ id: "new-tokenizer", config: {} }] } : null;
+    const value = url === "./api/bootstrap" ? bootstrap : url === "./api/jobs" ? { jobs } :
+      url === "./api/tokenizers" ? { tokenizers: [{ id: "new-tokenizer", config: {} }] } : null;
     assert.ok(value, `Unexpected workspace request: ${url}`);
     return { ok: true, json: async () => value };
   };
@@ -198,7 +220,7 @@ async function checkTrainingWorkspace() {
   await ui.poll();
   assert.equal(ui.state.tokenizers[0].id, "new-tokenizer", "Finished tokenizer becomes available for predictor tuning");
   assert.equal(ui.state.online, true);
-  assert.ok(!requests.some((url) => url.startsWith("/api/runs")));
+  assert.ok(!requests.some((url) => url.startsWith("./api/runs")));
   console.log("Kronos UI smoke passed: stages, batches, schedulers, reuse, persistence, compatibility, completed curves, workspace initialization and polling.");
 }
 checkTrainingWorkspace().catch((error) => { console.error(error); process.exitCode = 1; });

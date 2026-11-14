@@ -4,27 +4,29 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Crypto Forecast · Model workspace</title>
-  <link rel="stylesheet" href="/styles.css">
-  <script src="/app.js" defer></script>
-  <script src="/vendor/lightweight-charts.js" defer></script>
-  <script src="/chart_view.js" defer></script>
-  <script src="/chart.js" defer></script>
-  <script src="/testing.js" defer></script>
+  <title>CandleRoute Forecasting</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./connection.js" defer></script>
+  <script src="./app.js" defer></script>
+  <script src="./vendor/lightweight-charts.js" defer></script>
+  <script src="./chart_view.js" defer></script>
+  <script src="./chart.js" defer></script>
+  <script src="./testing.js" defer></script>
 </head>
 <body>
   <header class="app-header">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>Crypto Forecast</span><span class="brand-context">Model workspace</span></div>
-    <div class="connection" id="connection"><span class="connection-dot"></span><span id="connection-text">Connecting to local server</span></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>Forecasting</span></div>
+    <div class="connection" id="connection" role="status"><span class="connection-dot"></span><span id="connection-text">Connecting…</span></div>
   </header>
   <main>
+    <div id="page-error" class="notice error" role="alert" hidden></div>
     <nav class="workspace-tabs" role="tablist" aria-label="Model workspace">
       <button id="chart-tab-button" type="button" role="tab" aria-selected="true" aria-controls="chart-tab">Chart forecasts</button>
       <button id="testing-tab-button" type="button" role="tab" aria-selected="false" aria-controls="testing-tab" tabindex="-1">Model testing</button>
       <button id="training-tab-button" type="button" role="tab" aria-selected="false" aria-controls="training-tab" tabindex="-1">Training &amp; fine-tuning</button>
     </nav>
     <section id="chart-tab" role="tabpanel" aria-labelledby="chart-tab-button">
-      <div class="page-intro"><div><h1>Look ahead, candle by candle.</h1><p>Choose a coin and how far ahead to forecast. Kronos uses your downloaded price history and original weights.</p></div><span class="preview-badge">Read-only inference</span></div>
+      <div class="page-intro"><div><h1>Chart forecasts</h1><p>Use Kronos to forecast future candles from your downloaded price history.</p></div></div>
       <div class="workspace chart-workspace">
         <aside class="setup-panel panel" aria-labelledby="chart-setup-title">
           <div class="section-heading"><h2 id="chart-setup-title">Select a chart</h2><button id="chart-refresh" class="text-button" type="button">Refresh charts</button></div>
@@ -109,12 +111,11 @@
     </section>
     <section id="training-tab" role="tabpanel" aria-labelledby="training-tab-button" hidden>
     <div class="page-intro">
-      <div><h1>Train. Observe. Evaluate.</h1><p>Optional training and fine-tuning. Kronos runs save a separate checkpoint; original weights stay unchanged.</p></div>
+      <div><h1>Training and fine-tuning</h1><p>Train GRU and LSTM models or fine-tune Kronos. Each run saves its own checkpoint.</p></div>
       <div id="model-flow" class="model-flow" aria-label="Completed candles predict one, seven, and thirty days ahead">
         <div id="candle-group" class="candle-group"><span>15m</span><span>1h</span><span>4h</span><span>1d</span></div><span class="flow-line" aria-hidden="true"></span><div class="forecast-horizons">1 / 7 / 30 <small>days ahead</small></div>
       </div>
     </div>
-    <div id="page-error" class="notice error" role="alert" hidden></div>
     <div class="workspace">
       <aside class="setup-panel panel" aria-labelledby="setup-title">
         <div class="section-heading"><h2 id="setup-title">Training setup</h2><span id="origin-tag" class="subtle-tag">4-hour origins</span></div>

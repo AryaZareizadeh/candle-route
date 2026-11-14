@@ -15,6 +15,7 @@ import uuid
 import joblib
 import requests
 
+import spot_kronos
 from spot_data import APPROVED_ASSETS, NobitexPublicSpot, PublicSpotData, source_for
 from spot_portfolio import D, SpotCosts, SpotRisk, book_quote, execute_targets, mark, new_state, target_weights
 from spot_research import RESEARCH_VERSION, _best_forecasts, fit_models, forecasts_for, frames_for, run_experiment
@@ -22,6 +23,11 @@ from spot_research import RESEARCH_VERSION, _best_forecasts, fit_models, forecas
 
 PAPER_HISTORY_LIMIT = 500
 PAPER_HISTORY_KINDS = ("equity", "fills", "orders", "decisions")
+
+
+class OfflinePaperSession(requests.Session):
+    def request(self, *args, **kwargs):
+        raise ValueError("Paper market data is unavailable while CandleRoute is offline")
 
 
 def _overlap(a, b):
@@ -46,10 +52,11 @@ def _overlap(a, b):
 
 
 class SpotPaperService:
-    def __init__(self, store, *, signals=None, venue=None):
+    def __init__(self, store, *, signals=None, venue=None, forecast_workspace=None, offline=False):
         self.store = store
-        self.signals = signals or PublicSpotData()
-        self.venue = venue or NobitexPublicSpot()
+        self.signals = signals or PublicSpotData(session=OfflinePaperSession() if offline else None)
+        self.venue = venue or NobitexPublicSpot(session=OfflinePaperSession() if offline else None)
+        self.forecast_workspace = Path(forecast_workspace).absolute() if forecast_workspace is not None else None
         self.lock = threading.RLock()
         self.tick_lock = threading.Lock()
         self.generation = 0
@@ -152,13 +159,26 @@ class SpotPaperService:
             status["reason"] = "Saved paper model could not be read; run historical research again"
         return status
 
-    def start(self, assets=None, budget=200):
+    def kronos_status(self):
+        return spot_kronos.model_status(self.forecast_workspace)
+
+    def start(self, assets=None, budget=200, *, signal_model=None):
+        if signal_model not in (None, "research", spot_kronos.MODEL):
+            raise ValueError("Choose a supported paper signal model")
         with self.lock:
             state = self.state()
             if state is None:
                 state = new_state(budget, assets or APPROVED_ASSETS)
+                state["signal_model"] = signal_model or "research"
             elif (assets is not None and list(assets) != state["assets"]) or D(budget) != D(state["budget_usdt"]):
                 raise ValueError("Existing paper portfolio has a fixed budget and universe")
+            active_model = state.get("signal_model", "research")
+            if signal_model is not None and signal_model != active_model:
+                raise ValueError("Reset the paper portfolio before choosing a different signal model")
+            if active_model == spot_kronos.MODEL:
+                readiness = self.kronos_status()
+                if not readiness["ready"]:
+                    raise ValueError(readiness["reason"])
             state["running"] = True
             self._save_state(state)
             self.generation += 1
@@ -322,6 +342,8 @@ class SpotPaperService:
             return True
 
     def _tick(self, state, generation):
+        if state.get("signal_model") == spot_kronos.MODEL:
+            return self._tick_kronos(state, generation)
         if not self.model_path.exists():
             return {"ok": False, "reason": "Run historical research before paper decisions"}
         with self.model_lock:
@@ -367,6 +389,48 @@ class SpotPaperService:
         if datetime.fromisoformat(newest).timestamp() != end:
             return {"ok": False, "reason": "Latest signal candle is stale"}
         predictions = _best_forecasts(forecast[newest])
+        return self._observe(state, generation, end, newest, books, rules, predictions,
+                             sources, package["version"] + ":" + package["method"])
+
+    def _tick_kronos(self, state, generation):
+        end = int(time.time() // 3600 * 3600)
+        newest = datetime.fromtimestamp(end, timezone.utc).isoformat()
+        if state.get("last_observation_at") == newest:
+            return {"ok": True, "reason": "Already processed this closed hour"}
+        rules = self.venue.rules()
+        predictions, sources = {}, {}
+        if end // 3600 % 4 == 0 and time.time() - end <= 600:
+            readiness = self.kronos_status()
+            if not readiness["ready"]:
+                return {"ok": False, "reason": readiness["reason"]}
+            start = end - spot_kronos.LOOKBACK * 3600
+            contexts = {}
+            for asset in sorted(state["assets"]):
+                if asset not in rules["quantity_steps"]:
+                    continue
+                source = source_for(asset)
+                try:
+                    history = self.signals.fetch(asset, "1h", start, end)
+                    contexts[asset] = spot_kronos.candle_context(asset, history["candles"], end, source)
+                    sources[asset] = source
+                except (ValueError, KeyError, TypeError, OSError, requests.RequestException):
+                    continue
+            if not contexts:
+                return {"ok": False, "reason": "No contiguous closed-hour Kronos candle context is available"}
+            try:
+                predictions = spot_kronos.predict(self.forecast_workspace, contexts, end)
+            except ValueError as exc:
+                return {"ok": False, "reason": str(exc)}
+            owned = {asset for asset, quantity in state["holdings"].items() if D(quantity) > 0}
+            if not predictions or not owned.issubset(predictions):
+                return {"ok": False, "reason": "Kronos has no valid forecast or is missing a forecast for a held asset"}
+            sources = {asset: sources[asset] for asset in predictions}
+        # Time-consuming inference can make earlier exchange order books stale.
+        books = self.venue.books()
+        return self._observe(state, generation, end, newest, books, rules, predictions, sources,
+                             spot_kronos.MODEL + ":original:4h")
+
+    def _observe(self, state, generation, end, newest, books, rules, predictions, sources, model_version):
         quotes = {}
         for asset, book in books.items():
             try:
@@ -389,10 +453,10 @@ class SpotPaperService:
         costs = SpotCosts(min_notional=D(rules["min_notional"]) + D("0.01"))
         targets, reason = target_weights(predictions, state, observed["equity_usdt"], costs=costs)
         state["decisions"].append({"at": newest, "reason": reason, "signal_sources": sources,
-                                   "forecast": predictions})
+                                   "forecast": predictions, "model_version": model_version})
         execute_targets(state, targets, quotes, prices, costs=costs,
                         quantity_steps=rules["quantity_steps"], at=newest,
-                        reason=reason, model_version=package["version"] + ":" + package["method"],
+                        reason=reason, model_version=model_version,
                         liquidation_prices={a: float(q["bid"] * (1 - costs.fee_rate)) for a, q in quotes.items()})
         state["last_observation_at"] = datetime.fromtimestamp(end, timezone.utc).isoformat()
         if not self._save_tick(state, generation):

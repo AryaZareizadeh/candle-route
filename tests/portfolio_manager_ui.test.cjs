@@ -95,8 +95,24 @@ function dashboard() {
   vm.runInContext('var toastMessages = []; showToast = message => toastMessages.push(String(message));', context);
   element('managerBudget').value = '200';
   element('managerDays').value = '365';
+  element('managerSignalModel').value = 'research';
   return {context, element, timers, assets: () => assetInputs, run: code => vm.runInContext(code, context)};
 }
+
+test('Kronos paper setup uses its own readiness instead of the historical model', () => {
+  const page = dashboard();
+  page.run("renderPortfolioManager({approved_assets:['ETH'],model_status:{ready:false,reason:'Run research'},kronos_status:{ready:true,method:'kronos-small'}})");
+  assert.equal(page.element('managerStartBtn').disabled, true);
+  page.element('managerSignalModel').value = 'kronos-small';
+  page.run('updateManagedControls()');
+  assert.equal(page.element('managerStartBtn').disabled, false);
+  assert.match(page.element('managerModelNote').textContent, /Kronos-small/);
+  assert.equal(page.run('managerSetupPayload().signal_model'), 'kronos-small');
+  assert.equal(page.run('managerSetupPayload(true).signal_model'), undefined);
+  page.run("renderPortfolioManager({...managerData,paper:{running:false,assets:['ETH'],budget_usdt:200,signal_model:'kronos-small'}})");
+  assert.equal(page.element('managerSignalModel').disabled, true);
+  assert.equal(page.run('managerSetupPayload().signal_model'), undefined);
+});
 
 function renderReady(page, extra = '') {
   page.run(`renderPortfolioManager({approved_assets:['BTC','XAUT'], paper:null,

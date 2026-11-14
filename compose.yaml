@@ -1,6 +1,9 @@
 services:
   dashboard:
-    build: .
+    build:
+      context: .
+      args:
+        TRAINER_DEVICE: ${TRAINER_DEVICE:-cpu}
     restart: unless-stopped
     init: true
     env_file: docker.env

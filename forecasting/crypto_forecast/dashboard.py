@@ -27,12 +27,12 @@ import uuid
 from .pipeline import TrainingConfig
 from .data import _coins
 from .model import MODEL_SPECS
+from .dashboard_web import body_limit, static_response
 
 ACTIVE = {"queued", "running", "awaiting_decision"}
 TERMINAL = {"completed", "failed", "stopped", "interrupted"}
 COIN_LIMIT = 100
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}\Z")
-WEB = Path(__file__).with_name("web")
 
 
 def utc_now():
@@ -179,8 +179,9 @@ def publish_download(stage, destination, coins):
 
 
 class JobManager:
-    def __init__(self, workspace):
+    def __init__(self, workspace, *, offline=False):
         self.workspace = Path(workspace).resolve()
+        self.offline = offline
         self.jobs_dir = self.workspace / ".dashboard" / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._ownership = (self.jobs_dir.parent / "server.lock").open("a+b")
@@ -201,6 +202,7 @@ class JobManager:
             raise ValueError("A dashboard already owns this project workspace. Use its existing browser address.") from None
         self.lock = threading.RLock()
         self.processes = {}
+        self.monitors = {}
         self.stopping = set()
         self.sent_decisions = {}
         self.closed = False
@@ -217,7 +219,10 @@ class JobManager:
     def _path(self, identifier):
         if not isinstance(identifier, str) or not IDENTIFIER.fullmatch(identifier):
             raise DashboardError(404, "Job not found.")
-        return self.jobs_dir / f"{identifier}.json"
+        path = self.jobs_dir / f"{identifier}.json"
+        if path.resolve() != path:
+            raise DashboardError(404, "Job not found.")
+        return path
 
     def get_job(self, identifier):
         try:
@@ -252,6 +257,8 @@ class JobManager:
         operation = payload.get("operation", "train")
         if not isinstance(operation, str) or operation not in {"train", "download"}:
             raise DashboardError(400, "Operation must be train or download.")
+        if self.offline and operation == "download":
+            raise DashboardError(503, "Candle downloads are disabled in offline mode.")
         name = payload.get("name", "")
         if not isinstance(name, str) or len(name) > 120:
             raise DashboardError(400, "Run name must be text of at most 120 characters.")
@@ -328,10 +335,14 @@ class JobManager:
             return self.get_job(identifier)
 
     def _launch(self, job):
-        environment = os.environ.copy()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("TRADER_", "NOBITEX_", "DASHBOARD_", "SMTP_"))}
         package_root = str(Path(__file__).resolve().parent.parent)
         environment["PYTHONPATH"] = package_root + os.pathsep + environment.get("PYTHONPATH", "")
         environment["PYTHONUNBUFFERED"] = "1"
+        if self.offline:
+            environment["HF_HUB_OFFLINE"] = "1"
+            environment["TRANSFORMERS_OFFLINE"] = "1"
         log_path = self.jobs_dir / f"{job['id']}.log"
         with log_path.open("wb") as output:
             process = subprocess.Popen([sys.executable, "-u", "-m", "crypto_forecast.dashboard_worker",
@@ -339,7 +350,9 @@ class JobManager:
                                        stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         self.processes[job["id"]] = process
-        threading.Thread(target=self._monitor, args=(job["id"], process), daemon=True).start()
+        monitor = threading.Thread(target=self._monitor, args=(job["id"], process), daemon=True)
+        self.monitors[job["id"]] = monitor
+        monitor.start()
 
     def chart_preview(self, payload):
         from .chart_forecast import prepare_chart
@@ -489,6 +502,7 @@ class JobManager:
                         process.stdin.close()
                     except (OSError, ValueError):
                         pass
+                self.monitors.pop(identifier, None)
 
     def _publish_pending_coin(self, identifier, process):
         with self.lock:
@@ -577,12 +591,25 @@ class JobManager:
             if self.closed:
                 return
             self.closed = True
-            try:
+        try:
+            with self.lock:
                 for job in self.list_jobs():
                     if job["status"] in ACTIVE:
                         self.stop_job(job["id"])
-            finally:
-                self._ownership.close()
+                # A worker can publish completed before it closes its files.
+                # Keep the workspace lease until its process and monitor exit.
+                monitors = tuple(self.monitors.values())
+                for identifier in self.monitors:
+                    process = self.processes[identifier]
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            for monitor in monitors:
+                monitor.join(timeout=5)
+        finally:
+            self._ownership.close()
 
     def _kronos_paths(self, variant="kronos-small"):
         from .kronos_setup import PRETRAINED_MODELS, TOKENIZER_ID
@@ -857,6 +884,73 @@ class JobManager:
         return sorted(tokenizers, key=lambda item: item["created_at"] or "", reverse=True)
 
 
+def get_response(manager, path, csrf_token):
+    """Read a dashboard resource after the transport has authenticated it."""
+    try:
+        if path == "/api/bootstrap":
+            import torch
+            return 200, {
+                "csrf_token": csrf_token, "defaults": manager.defaults(), "data": manager.data_status(),
+                "hardware": {"cuda_available": torch.cuda.is_available()}, "jobs": manager.list_jobs(),
+                "saved_runs": manager.list_saved_runs(), "tokenizers": manager.list_tokenizers(),
+                "chart_models": manager.chart_models(), "models": list(MODEL_SPECS.values()),
+            }
+        if path == "/api/jobs":
+            jobs = manager.list_jobs()
+            return 200, {
+                "jobs": jobs, "active_job": next((job for job in jobs if job["status"] in ACTIVE), None),
+            }
+        if re.fullmatch(r"/api/chart/forecasts/[^/]+", path):
+            return 200, manager.chart_result(path.split("/")[-1])
+        if re.fullmatch(r"/api/jobs/[^/]+", path):
+            return 200, manager.get_job(path.split("/")[-1])
+        if path == "/api/tokenizers":
+            return 200, {"tokenizers": manager.list_tokenizers()}
+        if path == "/api/saved-runs":
+            return 200, {"saved_runs": manager.list_saved_runs()}
+        raise DashboardError(404, "Page not found.")
+    except DashboardError as error:
+        return error.status, {"error": str(error)}
+    except (ValueError, OSError, KeyError):
+        return 404, {"error": "Requested file or result is not available."}
+
+
+def post_response(manager, path, content_type, body):
+    """Process a bounded request body after the transport has checked CSRF."""
+    try:
+        if re.fullmatch(r"/api/jobs/[^/]+/stop", path):
+            return 200, manager.stop_job(path.split("/")[3])
+        actions = {
+            "/api/jobs": (201, manager.start_job),
+            "/api/chart/preview": (200, manager.chart_preview),
+            "/api/chart/forecast": (201, manager.start_chart_forecast),
+            "/api/testing/chart": (200, manager.testing_chart),
+            "/api/testing/forecast": (201, lambda value: manager.start_chart_forecast(value, testing=True)),
+        }
+        delete = re.fullmatch(r"/api/runs/([^/]+)/delete", path)
+        decision = re.fullmatch(r"/api/jobs/([^/]+)/decision", path)
+        if path not in actions and not delete and not decision:
+            raise DashboardError(404, "Action not found.")
+        if content_type.split(";")[0] != "application/json":
+            raise DashboardError(400, "Send settings as JSON.")
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            raise DashboardError(400, "Invalid JSON settings.") from None
+        if delete:
+            if payload != {}:
+                raise DashboardError(400, "Send an empty JSON object to remove a saved run.")
+            return 200, manager.remove_run(delete[1])
+        if decision:
+            return 200, manager.decide_training(decision[1], payload)
+        status, action = actions[path]
+        return status, action(payload)
+    except DashboardError as error:
+        return error.status, {"error": str(error)}
+    except (ValueError, TypeError) as error:
+        return 400, {"error": str(error)}
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "CryptoForecastDashboard"
 
@@ -892,42 +986,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             self._trusted()
             path = unquote(urlsplit(self.path).path)
-            manager = self.server.manager
-            static = {"/": ("index.html", "text/html; charset=utf-8"),
-                      "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-                      "/chart.js": ("chart.js", "text/javascript; charset=utf-8"),
-                      "/chart_view.js": ("chart_view.js", "text/javascript; charset=utf-8"),
-                      "/testing.js": ("testing.js", "text/javascript; charset=utf-8"),
-                      "/vendor/lightweight-charts.js": ("vendor/lightweight-charts/lightweight-charts.js", "text/javascript; charset=utf-8"),
-                      "/styles.css": ("styles.css", "text/css; charset=utf-8")}
-            if path in static:
-                filename, mime = static[path]
-                self._send(200, (WEB / filename).read_bytes(), mime)
-            elif path == "/api/bootstrap":
-                import torch
-                self._send(200, {"csrf_token": self.server.csrf_token, "defaults": manager.defaults(),
-                                 "data": manager.data_status(), "hardware": {"cuda_available": torch.cuda.is_available()},
-                                 "jobs": manager.list_jobs(),
-                                 "saved_runs": manager.list_saved_runs(),
-                                 "tokenizers": manager.list_tokenizers(),
-                                 "chart_models": manager.chart_models(),
-                                 "models": list(MODEL_SPECS.values())})
-            elif path == "/api/jobs":
-                jobs = manager.list_jobs()
-                self._send(200, {"jobs": jobs, "active_job": next((j for j in jobs if j["status"] in ACTIVE), None)})
-            elif re.fullmatch(r"/api/chart/forecasts/[^/]+", path):
-                self._send(200, manager.chart_result(path.split("/")[-1]))
-            elif re.fullmatch(r"/api/jobs/[^/]+", path):
-                self._send(200, manager.get_job(path.split("/")[-1]))
-            elif path == "/api/tokenizers":
-                self._send(200, {"tokenizers": manager.list_tokenizers()})
-            elif path == "/api/saved-runs":
-                self._send(200, {"saved_runs": manager.list_saved_runs()})
+            asset = static_response(path)
+            if asset is not None:
+                self._send(200, *asset)
             else:
-                raise DashboardError(404, "Page not found.")
+                self._send(*get_response(self.server.manager, path, self.server.csrf_token))
         except DashboardError as error:
             self._send(error.status, {"error": str(error)})
-        except (ValueError, OSError, KeyError):
+        except OSError:
             self._send(404, {"error": "Requested file or result is not available."})
 
     def do_POST(self):
@@ -935,8 +1001,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             path = unquote(urlsplit(self.path).path)
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                limit = 1_200_000 if path in ("/api/chart/preview", "/api/chart/forecast") else 65536
-                if not 0 <= length <= limit:
+                if not 0 <= length <= body_limit(path):
                     raise ValueError
             except ValueError:
                 raise DashboardError(400, "Invalid request size.") from None
@@ -945,40 +1010,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Consume the bounded request body before rejecting its token/origin.
             # Closing with unread TCP bytes can reset a Windows client's socket.
             self._trusted(mutation=True)
-            path = unquote(urlsplit(self.path).path)
-            if path in ("/api/jobs", "/api/chart/preview", "/api/chart/forecast", "/api/testing/chart", "/api/testing/forecast") or re.fullmatch(r"/api/jobs/[^/]+/decision|/api/runs/[^/]+/delete", path):
-                if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-                    raise DashboardError(400, "Send settings as JSON.")
-                try:
-                    if not length:
-                        raise ValueError
-                    payload = json.loads(body)
-                except (ValueError, UnicodeDecodeError):
-                    raise DashboardError(400, "Invalid JSON settings.") from None
-                if path == "/api/jobs":
-                    self._send(201, self.server.manager.start_job(payload))
-                elif path == "/api/chart/preview":
-                    self._send(200, self.server.manager.chart_preview(payload))
-                elif path == "/api/chart/forecast":
-                    self._send(201, self.server.manager.start_chart_forecast(payload))
-                elif path == "/api/testing/chart":
-                    self._send(200, self.server.manager.testing_chart(payload))
-                elif path == "/api/testing/forecast":
-                    self._send(201, self.server.manager.start_chart_forecast(payload, testing=True))
-                elif re.fullmatch(r"/api/runs/[^/]+/delete", path):
-                    if payload != {}:
-                        raise DashboardError(400, "Send an empty JSON object to remove a saved run.")
-                    self._send(200, self.server.manager.remove_run(path.split("/")[3]))
-                else:
-                    self._send(200, self.server.manager.decide_training(path.split("/")[3], payload))
-            elif re.fullmatch(r"/api/jobs/[^/]+/stop", path):
-                self._send(200, self.server.manager.stop_job(path.split("/")[3]))
-            else:
-                raise DashboardError(404, "Action not found.")
+            self._send(*post_response(self.server.manager, path, self.headers.get("Content-Type", ""), body))
         except DashboardError as error:
             self._send(error.status, {"error": str(error)})
-        except (ValueError, TypeError) as error:
-            self._send(400, {"error": str(error)})
 
 
 class DashboardServer(ThreadingHTTPServer):

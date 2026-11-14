@@ -178,3 +178,12 @@ reconcile every saved or unresolved order/position, and resume explicitly. Do
 not start both machines against the account: database locks cannot coordinate
 separate copies. For rollback, stop the server first, transfer its newest state
 back, reconcile again and only then resume the Windows runtime.
+When starting CandleRoute from a new checkout with an existing Compose install,
+pass `docker compose -p <existing-project-name>` so Compose opens the existing
+`trader_data` volume. Use `docker compose ls` to check the project name. Back up
+the old runtime before the switch. For an isolated trial, restore a backup to a
+separate volume and bind the trial deployment to a different host port.
+
+Each account's `forecasting/` folder is stored beside its `trader.sqlite3`.
+The stopped-runtime bundle includes durable forecasting files. Keep `docker.env`
+and its master key backed up separately.

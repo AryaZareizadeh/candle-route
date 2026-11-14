@@ -94,3 +94,38 @@ def test_multiuser_bundle_contains_private_stores_and_candle_cache(tmp_path):
     assert (destination / 'accounts.sqlite3').is_file()
     assert (destination / 'candles.sqlite3').is_file()
     assert (destination / 'users' / ('b' * 32) / 'models' / ('a' * 32 + '.pt')).is_file()
+
+
+def test_forecasting_import_and_bundle_keep_durable_files(tmp_path):
+    from backup import backup_bundle, restore_bundle
+    from forecast_storage import import_forecasting
+
+    old = tmp_path / 'old'
+    durable = {
+        'data/1h/BTC.csv': b'candle history',
+        'models/kronos-small/model/model.safetensors': b'original weights',
+        'runs/saved/tokenizer.pt': b'checkpoint',
+        '.dashboard/jobs/forecast-123.json': b'{}',
+        '.dashboard/charts/forecast-123/result.json': b'{}',
+    }
+    for name, content in {**durable, 'data/_archives/cache.csv': b'cache',
+                          '.dashboard/jobs/download-data/staging.csv': b'staging',
+                          '.env': b'excluded'}.items():
+        path = old / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    root = tmp_path / 'runtime'
+    runtime(root)
+    workspace, count = import_forecasting(old, root)
+    assert count == len(durable)
+    assert {path.relative_to(workspace).as_posix(): path.read_bytes()
+            for path in workspace.rglob('*') if path.is_file()} == durable
+    assert (old / 'data/1h/BTC.csv').is_file()
+    with pytest.raises(ValueError, match='already contains'):
+        import_forecasting(old, root)
+
+    bundle, restored = tmp_path / 'backup.zip', tmp_path / 'restored'
+    backup_bundle(root, bundle)
+    restore_bundle(bundle, restored)
+    assert {path.relative_to(restored / 'forecasting').as_posix(): path.read_bytes()
+            for path in (restored / 'forecasting').rglob('*') if path.is_file()} == durable

@@ -21,7 +21,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import HTTPConnection
 
 from accounts import Accounts, canonical_email
-from auth import COOKIE, SAFE_METHODS, BoundedAuthWork, AuthWorkBusy
+from auth import (
+    COOKIE, SAFE_METHODS, BoundedAuthWork, AuthWorkBusy, forecast_session_headers,
+    frame_options, is_forecast_path,
+)
 from settings import ROOT, data_dir, load_environment
 from runtime_lease import FileLease
 
@@ -235,19 +238,20 @@ class MultiAuthMiddleware:
             return await reject(400, "Invalid host or origin")
 
         path = scope["path"]
-        protected = path.startswith("/api/") or socket or path in {"/docs", "/redoc", "/openapi.json"}
+        protected = (path.startswith("/api/") or is_forecast_path(path) or socket
+                     or path in {"/docs", "/redoc", "/openapi.json"})
         session = self.sessions.get(conn.cookies.get(COOKIE))
         if protected and path not in self.PUBLIC:
             if not session:
                 return await reject(401, "Authentication required")
-            if not socket and scope["method"] not in SAFE_METHODS:
-                csrf = conn.headers.get("x-csrf-token", "")
-                try:
-                    valid = hmac.compare_digest(csrf.encode("ascii"), session.csrf_token.encode("ascii"))
-                except UnicodeError:
-                    valid = False
-                if not valid:
+            if not socket:
+                csrf = conn.headers.get("x-csrf-token")
+                if scope["method"] not in SAFE_METHODS and not hmac.compare_digest(
+                    (csrf or "").encode(), session.csrf_token.encode(),
+                ):
                     return await reject(403, "Invalid CSRF token")
+                if not forecast_session_headers(scope, session, csrf):
+                    return await reject(401, "Authentication required")
         if session:
             scope["user_id"] = session.user_id
             scope["user_name"] = session.username
@@ -255,7 +259,7 @@ class MultiAuthMiddleware:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 headers.extend([(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"),
-                                (b"x-frame-options", b"DENY"), (b"referrer-policy", b"no-referrer")])
+                                (b"x-frame-options", frame_options(path)), (b"referrer-policy", b"no-referrer")])
                 message = {**message, "headers": headers}
             await send(message)
 
