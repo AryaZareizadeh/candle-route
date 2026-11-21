@@ -1,7 +1,7 @@
 """Shared persistent public candles, independent of account and trading state.
 
-Connections live only for individual database operations.  Series locks can
-therefore span a cache recheck and an HTTP request without holding SQLite open.
+Database transactions live only for individual operations. Series locks can
+span a cache recheck and an HTTP request without holding a transaction open.
 Importing this module creates no files or database connections.
 """
 import hashlib
@@ -12,11 +12,12 @@ import sqlite3
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from postgres import MIGRATIONS, get_database
 from settings import data_dir
 
 
@@ -31,7 +32,7 @@ _DURATIONS = {
 _thread_locks = {}
 _thread_locks_guard = threading.Lock()
 _held_locks = threading.local()
-_SQLITE_INTEGER_LIMIT = 2 ** 63 - 1
+_INTEGER_LIMIT = 2 ** 63 - 1
 
 
 def canonical_interval(interval):
@@ -50,8 +51,8 @@ def _integer_time(value):
     integer = int(value)
     if not math.isfinite(float(value)) or integer != float(value):
         raise ValueError("A candle timestamp must be a finite integer")
-    if not -_SQLITE_INTEGER_LIMIT <= integer <= _SQLITE_INTEGER_LIMIT:
-        raise ValueError("Candle timestamp is outside SQLite's integer range")
+    if not -_INTEGER_LIMIT <= integer <= _INTEGER_LIMIT:
+        raise ValueError("Candle timestamp is outside the supported integer range")
     return integer
 
 
@@ -88,6 +89,12 @@ def _series(exchange, instrument, interval):
     return exchange, instrument, canonical_interval(interval)
 
 
+def _held_keys():
+    if not hasattr(_held_locks, "keys"):
+        _held_locks.keys = set()
+    return _held_locks.keys
+
+
 @contextmanager
 def _file_lock(database_path, key):
     """Reentrant thread lock plus an advisory OS lock shared across processes."""
@@ -96,9 +103,7 @@ def _file_lock(database_path, key):
     with _thread_locks_guard:
         lock = _thread_locks.setdefault(identity, threading.RLock())
     with lock:
-        held = getattr(_held_locks, "locks", None)
-        if held is None:
-            held = _held_locks.locks = set()
+        held = _held_keys()
         if identity in held:
             yield
             return
@@ -138,7 +143,17 @@ def _file_lock(database_path, key):
 
 
 class CandleStore:
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, database=None):
+        if path is not None and database is not None:
+            raise ValueError("Choose a SQLite path or PostgreSQL for the candle store")
+        self.database = database
+        if path is None and self.database is None:
+            self.database = get_database()
+        self.path = None
+        if self.database is not None:
+            self.database.migrate("market", MIGRATIONS / "market")
+            return
+
         self.path = Path(path if path is not None else data_dir() / "candles.sqlite3").resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Serializing initialization also avoids journal-mode races when many
@@ -177,19 +192,43 @@ class CandleStore:
 
     @contextmanager
     def _connection(self):
-        connection = sqlite3.connect(self.path, timeout=30)
-        try:
-            with connection:
+        if self.database is not None:
+            with self.database.connection() as connection:
                 yield connection
-        finally:
-            connection.close()
+            return
+        with closing(sqlite3.connect(self.path, timeout=30)) as connection, connection:
+            yield connection
+
+    def _statement(self, query):
+        return query.replace("?", "%s") if self.database is not None else query
+
+    def _bar_bound(self, value, round_bound):
+        # A float parameter makes PostgreSQL cast the indexed BIGINT column
+        # to double precision. Rounding preserves the integer comparisons.
+        if self.database is not None and isinstance(value, float) and math.isfinite(value):
+            return round_bound(value)
+        return value
 
     @contextmanager
     def series_lock(self, exchange, instrument, interval):
         """Coordinate a cache recheck and fetch for one canonical series."""
         key = json.dumps(_series(exchange, instrument, interval), separators=(",", ":"))
-        with _file_lock(self.path, key):
+        if self.database is None:
+            with _file_lock(self.path, key):
+                yield
+            return
+
+        identity = self.database.dsn, key
+        held = _held_keys()
+        if identity in held:
             yield
+            return
+        with self.database.lock(f"market:candles:{key}", wait=True):
+            held.add(identity)
+            try:
+                yield
+            finally:
+                held.remove(identity)
 
     def save(self, exchange, instrument, interval, rows, *, as_of):
         """Atomically retain valid completed rows, never revising stored bars."""
@@ -209,8 +248,8 @@ class CandleStore:
                     continue
                 if not all(math.isfinite(value) and value > 0 for value in prices):
                     continue
-                opening, high, low, closing = prices
-                if not low <= opening <= high or not low <= closing <= high:
+                opening, high, low, close = prices
+                if not low <= opening <= high or not low <= close <= high:
                     continue
                 if not math.isfinite(volume) or volume < 0:
                     continue
@@ -223,19 +262,22 @@ class CandleStore:
                 continue
         if not records:
             return 0
-        with self._connection() as connection:
-            previous = connection.total_changes
-            connection.executemany("INSERT OR IGNORE INTO candles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
-            return connection.total_changes - previous
+        query = self._statement("""INSERT INTO candles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (exchange, instrument, interval, open_time) DO NOTHING""")
+        with self._connection() as connection, closing(connection.cursor()) as cursor:
+            cursor.executemany(query, records)
+            return cursor.rowcount
 
     def read(self, exchange, instrument, interval, *, start=None, end=None, as_of=None, limit=None):
         """Read chronological rows; a limit selects the newest matching bars."""
         parameters = list(_series(exchange, instrument, interval))
         conditions = ["exchange=?", "instrument=?", "interval=?"]
-        for value, condition in ((start, "open_time>=?"), (end, "open_time<?"), (as_of, "close_time<=?")):
+        bounds = ((start, "open_time>=?", math.ceil), (end, "open_time<?", math.ceil),
+                  (as_of, "close_time<=?", math.floor))
+        for value, condition, round_bound in bounds:
             if value is not None:
                 conditions.append(condition)
-                parameters.append(value)
+                parameters.append(self._bar_bound(value, round_bound))
         query = "SELECT open_time, close_time, open, high, low, close, volume, metadata FROM candles WHERE " + " AND ".join(conditions)
         if limit is None:
             query += " ORDER BY open_time"
@@ -246,7 +288,7 @@ class CandleStore:
             query += " ORDER BY open_time DESC LIMIT ?"
             parameters.append(limit)
         with self._connection() as connection:
-            rows = connection.execute(query, parameters).fetchall()
+            rows = connection.execute(self._statement(query), parameters).fetchall()
         if limit is not None:
             rows.reverse()
         return [dict(open_time=row[0], close_time=row[1], open=row[2], high=row[3], low=row[4],
@@ -261,10 +303,10 @@ class CandleStore:
         if end <= start or ttl <= 0:
             return
         with self._connection() as connection:
-            connection.execute("DELETE FROM checked_empty WHERE expires_at<=?", (now,))
-            connection.execute("""INSERT INTO checked_empty VALUES (?, ?, ?, ?, ?, ?)
+            connection.execute(self._statement("DELETE FROM checked_empty WHERE expires_at<=?"), (now,))
+            connection.execute(self._statement("""INSERT INTO checked_empty VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exchange, instrument, interval, start_time, end_time)
-                DO UPDATE SET expires_at=excluded.expires_at""", (*series, start, end, now + ttl))
+                DO UPDATE SET expires_at=excluded.expires_at"""), (*series, start, end, now + ttl))
 
     def missing_ranges(self, exchange, instrument, interval, start, end, *, now):
         """Subtract actual candle coverage and unexpired checked-empty spans."""
@@ -273,13 +315,17 @@ class CandleStore:
             raise ValueError("Candle range bounds and time must be finite")
         if end <= start:
             return []
+        bar_end = self._bar_bound(end, math.ceil)
+        bar_start = self._bar_bound(start, math.floor)
+        bar_now = self._bar_bound(now, math.floor)
         with self._connection() as connection:
-            bars = connection.execute("""SELECT open_time, close_time FROM candles
+            bars = connection.execute(self._statement("""SELECT open_time, close_time FROM candles
                 WHERE exchange=? AND instrument=? AND interval=?
-                AND open_time<? AND close_time>? AND close_time<=?""", (*series, end, start, now)).fetchall()
-            empty = connection.execute("""SELECT start_time, end_time FROM checked_empty
+                AND open_time<? AND close_time>? AND close_time<=?"""),
+                (*series, bar_end, bar_start, bar_now)).fetchall()
+            empty = connection.execute(self._statement("""SELECT start_time, end_time FROM checked_empty
                 WHERE exchange=? AND instrument=? AND interval=?
-                AND start_time<? AND end_time>? AND expires_at>?""", (*series, end, start, now)).fetchall()
+                AND start_time<? AND end_time>? AND expires_at>?"""), (*series, end, start, now)).fetchall()
         cursor, missing = start, []
         for opened, closed in sorted(bars + empty):
             opened, closed = max(start, opened), min(end, closed)

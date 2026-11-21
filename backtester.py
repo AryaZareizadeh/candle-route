@@ -334,7 +334,7 @@ class ResearchPersistence:
 
     def _ensure_store(self):
         store = self._injected_store or get_store()
-        if self._loaded_path == store.path:
+        if self._loaded_path == store.workspace_id:
             return store
         self._jobs = {}
         self._prefs = self._load_prefs()
@@ -349,7 +349,7 @@ class ResearchPersistence:
                 snapshot.update(status="interrupted", error="Application stopped before job completion; start a new run.")
                 store.put(self.namespace + "_jobs", key, snapshot)
             self._jobs[key] = StoredResearchJob(snapshot)
-        self._loaded_path = store.path
+        self._loaded_path = store.workspace_id
         return store
 
     def load(self):

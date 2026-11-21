@@ -1,6 +1,5 @@
 """Read-only authenticated operational diagnostics for one account."""
 from datetime import datetime, timezone
-import json
 from fastapi import APIRouter
 from research_scheduler import queue_status
 from trading_audit import sanitized
@@ -29,11 +28,8 @@ def runtime_status(manager, exchange_state, jobs):
                          update_age_seconds=_age(bot.last_updated),
                          candle_age_seconds=_age(getattr(bot, "_last_processed_ts", None)),
                          unresolved_intents=sum(len(runner.unresolved_intents()) for runner in runners)))
-    with manager.store.connection() as conn:
-        rows = conn.execute("SELECT value FROM records WHERE namespace='audit_events' "
-                            "ORDER BY json_extract(value,'$.time') DESC LIMIT 100").fetchall()
-    audit = [{key: sanitized(value) for key, value in json.loads(row[0]).items()
-              if key in {"bot_id", "time", "event", "detail"}} for row in rows]
+    audit = [{key: sanitized(value) for key, value in record.items()
+              if key in {"bot_id", "time", "event", "detail"}} for record in manager.store.recent_audit(100)]
     return dict(captured_at=datetime.now(timezone.utc).isoformat(), bots=bots,
                 exchange={"age_seconds": _age(exchange_state.get("last_synced")),
                           "error": sanitized(exchange_state["error"]) if exchange_state.get("error") else None},

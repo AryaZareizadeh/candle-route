@@ -136,6 +136,26 @@ def test_completed_pair_retained_if_later_pair_fails(trainer):
     asyncio.run(run())
 
 
+def test_checkpoint_registry_rolls_back_if_job_publication_fails(trainer, monkeypatch):
+    original_write = trainer.store.write
+
+    def fail_publication(conn, namespace, key, value):
+        if namespace == "model_training_jobs" and value.get("model_ids"):
+            raise RuntimeError("Job progress could not be saved")
+        return original_write(conn, namespace, key, value)
+
+    monkeypatch.setattr(trainer.store, "write", fail_publication)
+
+    async def run():
+        job = await finished(trainer, trainer.start_job({}))
+        assert job["status"] == "failed"
+        assert job["model_ids"] == []
+        assert trainer.store.get("model_training_jobs", job["id"]) == job
+        assert trainer.list_models() == []
+
+    asyncio.run(run())
+
+
 def test_cancel_during_save_does_not_publish_checkpoint(trainer, monkeypatch):
     import alexnet_model
     def save(checkpoint, path):

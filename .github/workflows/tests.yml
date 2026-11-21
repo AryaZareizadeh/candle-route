@@ -23,6 +23,43 @@ jobs:
         env:
           TRADER_OFFLINE: 'true'
       - run: node --test tests/*.test.cjs
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.12
+        env:
+          POSTGRES_USER: candle_test
+          POSTGRES_PASSWORD: candle_test
+          POSTGRES_DB: candle_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U candle_test -d candle_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      TRADER_OFFLINE: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: 'requirements*.txt'
+      - run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          printf 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n' "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt -c requirements-lock.txt
+      - run: python -m pytest -q tests/test_postgres_runtime.py tests/test_postgres_core.py tests/test_postgres_market.py tests/test_postgres_transfer.py
+        env:
+          CANDLE_TEST_POSTGRES_URL: postgresql://candle_test:candle_test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/candle_test
   cpu-training:
     runs-on: ubuntu-latest
     steps:
@@ -71,7 +108,31 @@ jobs:
           docker run -d --name candle-route-smoke -p 127.0.0.1:8011:8011 -e TRADER_OFFLINE=true candle-route-smoke
           curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 2 --max-time 5 http://127.0.0.1:8011/healthz
           docker exec candle-route-smoke python -c 'from crypto_forecast.dashboard import JobManager'
+      - name: Verify Compose with PostgreSQL
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import secrets
+          from base64 import urlsafe_b64encode
+          Path('docker.env').write_text(
+              f'TRADER_MASTER_KEY={urlsafe_b64encode(secrets.token_bytes(32)).decode()}\n'
+              f'TRADER_INVITE_CODE={secrets.token_hex(16)}\n'
+              f'CANDLE_POSTGRES_PASSWORD={secrets.token_hex(32)}\n'
+              'SMTP_HOST=unused.invalid\nSMTP_FROM=candleroute@example.invalid\nTRADER_OFFLINE=true\n')
+          PY
+          docker rm -f candle-route-smoke
+          printf 'services:\n  dashboard:\n    image: candle-route-smoke\n' > compose.ci.yaml
+          docker compose --env-file docker.env -f compose.yaml -f compose.postgres.yaml -f compose.ci.yaml up -d --no-build --wait --wait-timeout 120
+          curl --fail --silent --show-error http://127.0.0.1:8011/readyz
       - if: failure()
-        run: docker logs candle-route-smoke
+        run: |
+          docker logs candle-route-smoke || true
+          if test -f compose.ci.yaml; then
+            docker compose --env-file docker.env -f compose.yaml -f compose.postgres.yaml -f compose.ci.yaml logs
+          fi
       - if: always()
-        run: docker rm -f candle-route-smoke
+        run: |
+          docker rm -f candle-route-smoke || true
+          if test -f compose.ci.yaml; then
+            docker compose --env-file docker.env -f compose.yaml -f compose.postgres.yaml -f compose.ci.yaml down -v
+          fi

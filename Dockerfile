@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.13-slim-trixie
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,7 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt requirements-lock.txt requirements-training.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -c requirements-lock.txt \
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt -c requirements-lock.txt \
     && useradd --uid 10001 --create-home trader \
     && mkdir /data && chown trader:trader /data
 ARG TRAINER_DEVICE=none
@@ -27,5 +29,5 @@ RUN if [ "$TRAINER_DEVICE" != none ]; then pip install --no-cache-dir -c require
 USER trader
 EXPOSE 8011
 VOLUME ["/data"]
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/healthz', timeout=3)" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/readyz', timeout=3)" || exit 1
 CMD ["python", "main.py"]

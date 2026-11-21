@@ -8,8 +8,9 @@ There is no Vue build, separate frontend server or trained AI model.
 
 With `TRADER_MULTIUSER=true`, `multiuser.py` authenticates accounts and dispatches
 each request to a separate dashboard instance. Account records and emailed code
-hashes are in `accounts.sqlite3`. Each user has a separate trading SQLite file,
-bot registry, research jobs, WebSocket stream, and exchange client. The user ID
+hashes are in PostgreSQL when configured. Each user has scoped trading rows,
+a private artifact workspace, bot registry, research jobs, WebSocket stream,
+and exchange client. In SQLite mode each user has a separate trading file. The user ID
 comes from the server-side session, never from a request path or body. Exchange
 credentials are encrypted in the account database with `TRADER_MASTER_KEY`.
 
@@ -19,7 +20,7 @@ credentials are encrypted in the account database with `TRADER_MASTER_KEY`.
 | `auth.py` | Operator password verification, in-memory sessions, CSRF and origin checks |
 | `server.py` | HTTP/WebSocket interface and application lifecycle |
 | `bot_manager.py`, `bot.py` | Bot configuration, runtime state and live order lifecycle |
-| `storage.py`, `migrations/` | SQLite transactions, schema version and database runtime lock |
+| `storage.py`, `postgres.py`, `migrations/` | State transactions, schema versions and deployment ownership |
 | `data.py`, `indicators.py` | OHLCV retrieval, closed-candle filtering and cached TA-Lib indicators |
 | `strategy.py` | AdvRSI, TrendMomentum and beta ExtremeReversal signal rules |
 | `execution_model.py`, `accounting.py` | Historical fills, costs, reserved capital and equity |
@@ -40,15 +41,16 @@ accounting assumptions. Existing real bots keep their exchange order policy.
 
 ## State and identity
 
-SQLite under `TRADER_DATA_DIR` is authoritative. Versioned records hold
+The configured backend is authoritative. Versioned records hold
 configuration, runtime snapshots, order intents and research results; a separate
 ownership table prevents two bots claiming the same account/position ID. Writes
-use transactions, foreign keys, WAL and full synchronization. The database lock
-prevents two application runtimes using the same database file.
+use transactions and database constraints. PostgreSQL scopes private records by
+account and uses one database-held deployment lock. SQLite uses WAL, full
+synchronization and a local file lock.
 
-That lock is local to a database on one machine. It cannot prevent two computers
-with independent database copies trading the same exchange account. The
-[migration runbook](operations.md) therefore requires one active deployment.
+Run one active deployment per exchange account, including during migration and
+restore. Model files and the standalone forecasting workspaces live under
+`TRADER_DATA_DIR` and are included in coordinated backup bundles.
 
 Legacy JSON files are migration inputs and remain intact. Restored bots start
 stopped. Interrupted research jobs remain visible as interrupted; optimizer
@@ -66,7 +68,7 @@ session; browser origins and hostnames must match configuration.
 That paragraph describes legacy single-user mode. In multi-user mode, invited
 users register with a username, password and verified email. Recovery codes expire
 after ten minutes and are single-use. Exchange credentials are encrypted at rest
-in `accounts.sqlite3` and are never returned by API responses. Remote HTTPS
+in the accounts store and are never returned by API responses. Remote HTTPS
 requires Secure cookies and a reverse proxy preserving the original Host.
 
 ## Tests

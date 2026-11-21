@@ -5,6 +5,7 @@ import pytest
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from bot_manager import BotManager
@@ -36,6 +37,41 @@ def model_package(assets=None, **changes):
     return {"version": RESEARCH_VERSION, "method": "momentum", "models": None,
             "assets": assets or ["BTC"], "run_id": "synthetic-run",
             "trained_at": "2026-10-01T00:00:00+00:00", **changes}
+
+
+def test_failed_research_publication_preserves_the_previous_paper_model(tmp_path, monkeypatch):
+    import spot_paper
+
+    history = {"valid": 200, "candles": []}
+    store = Store(tmp_path / "trader.sqlite3")
+    service = SpotPaperService(
+        store, signals=SimpleNamespace(fetch=lambda *args: history),
+        venue=SimpleNamespace(books=lambda: {"BTC": {}}, history=lambda *args: history))
+    joblib.dump(model_package(), service.model_path)
+    original = store.write
+
+    def fail_publication(conn, namespace, key, value):
+        if namespace == "spot_manager" and key == "experiments":
+            raise RuntimeError("Could not publish research history")
+        return original(conn, namespace, key, value)
+
+    monkeypatch.setattr(store, "write", fail_publication)
+    monkeypatch.setattr(spot_paper, "_overlap", lambda *args: {})
+    monkeypatch.setattr(spot_paper, "frames_for", lambda *args: {})
+    monkeypatch.setattr(spot_paper, "run_experiment", lambda *args, **kwargs: {
+        "selected": "momentum", "data_hash": "test", "code_hash": "test", "windows": [],
+        "validation_outcome": {"passed": True},
+    })
+    with pytest.raises(RuntimeError, match="Could not publish"):
+        service.research(["BTC"], days=90)
+    assert store.list("spot_experiments") == {}
+    assert store.get("spot_manager", "research") is None
+    assert service.model_status()["run_id"] == "synthetic-run"
+
+    monkeypatch.setattr(store, "write", original)
+    report = service.research(["BTC"], days=90)
+    assert service.model_status()["run_id"] == report["run_id"]
+    assert store.get("spot_experiments", report["run_id"]) == report
 
 
 def test_model_readiness_uses_artifact_and_saved_portfolio_assets(tmp_path):

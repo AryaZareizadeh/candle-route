@@ -6,7 +6,7 @@ from pathlib import Path
 import gzip
 import hashlib
 import json
-import shutil
+import re
 import statistics
 import threading
 import time
@@ -61,7 +61,7 @@ class SpotPaperService:
         self.tick_lock = threading.Lock()
         self.generation = 0
         self.model_lock = threading.RLock()
-        self.model_path = Path(store.path).parent / "spot_research_model.joblib"
+        self._legacy_model_path = store.artifact_dir / "spot_research_model.joblib"
 
     def state(self):
         with self.lock:
@@ -83,22 +83,14 @@ class SpotPaperService:
                 return []
             session_id = state["history_id"]
         prefix = f"{session_id}:{kind}:"
-        with self.store.connection() as conn:
-            query = "SELECT value FROM records WHERE namespace='spot_paper_history' AND key>=? AND key<? ORDER BY key DESC"
-            args = [prefix, prefix + "\uffff"]
-            if limit is not None:
-                query += " LIMIT ?"
-                args.append(limit)
-            rows = conn.execute(query, args).fetchall()
-        return [json.loads(row[0]) for row in reversed(rows)]
+        return self.store.paper_history(prefix, limit)
 
     def _save_state(self, state):
         """Commit new immutable events and a bounded state snapshot atomically."""
         history_id = state.get("history_id") or uuid.uuid4().hex
         counts = dict(state.get("history_counts", {}))
         bounded = dict(state)
-        with self.store.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.store.write_transaction() as conn:
             for kind in PAPER_HISTORY_KINDS:
                 total = counts.get(kind, 0)
                 entries = state.get(kind, [])
@@ -106,9 +98,7 @@ class SpotPaperService:
                 # events followed by the current tick's newly appended events.
                 pending = entries[min(total, PAPER_HISTORY_LIMIT):]
                 for index, entry in enumerate(pending, total + 1):
-                    conn.execute("INSERT INTO records(namespace,key,value) VALUES(?,?,?)",
-                                 ("spot_paper_history", f"{history_id}:{kind}:{index:020d}",
-                                  json.dumps(entry, allow_nan=False)))
+                    self.store.append(conn, "spot_paper_history", f"{history_id}:{kind}:{index:020d}", entry)
                 counts[kind] = total + len(pending)
                 bounded[kind] = entries[-PAPER_HISTORY_LIMIT:]
             bounded.update(history_id=history_id, history_counts=counts, history_limit=PAPER_HISTORY_LIMIT,
@@ -117,9 +107,18 @@ class SpotPaperService:
         state.clear()
         state.update(bounded)
 
+    @property
+    def model_path(self):
+        report = self.store.get("spot_manager", "research") or {}
+        name = report.get("model_artifact")
+        if name and isinstance(name, str) and re.fullmatch(r"spot_model_[A-Za-z0-9_-]+\.joblib", name):
+            return self._legacy_model_path.with_name(name)
+        return self._legacy_model_path
+
     def model_status(self):
         """Read readiness from the current artifact, including portfolio coverage."""
-        status = {"exists": self.model_path.exists(), "ready": False, "reason": None,
+        path = self.model_path
+        status = {"exists": path.exists(), "ready": False, "reason": None,
                   "version": None, "method": None, "assets": [],
                   "missing_paper_assets": [], "trained_at": None, "run_id": None}
         if not status["exists"]:
@@ -129,7 +128,7 @@ class SpotPaperService:
             # Read the actual file each time: rapid same-size rewrites can have
             # identical Windows timestamps. Do not block on market-data ticks.
             with self.model_lock:
-                package = joblib.load(self.model_path)
+                package = joblib.load(path)
             if not isinstance(package, dict):
                 raise ValueError("Invalid paper model package")
             assets = package.get("assets")
@@ -201,14 +200,14 @@ class SpotPaperService:
             state = self.state()
             backup_id = None
             reset_at = datetime.now(timezone.utc).isoformat()
-            with self.store.connection() as conn:
+            with self.store.write_transaction() as conn:
                 if state is not None:
                     backup_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
                     self.store.write(conn, "spot_paper_backups", backup_id,
                                      {"reset_at": reset_at, "paper": state,
                                       "history_id": state.get("history_id"),
                                       "history_counts": state.get("history_counts", {}),
-                                      "paper_error": self.store.get("spot_manager", "paper_error")})
+                                      "paper_error": self.store.read(conn, "spot_manager", "paper_error")})
                 self.store.write(conn, "spot_manager", "paper", None)
                 self.store.write(conn, "spot_manager", "paper_error", None)
             self.generation += 1
@@ -274,7 +273,7 @@ class SpotPaperService:
         result["run_id"] = run_id
         snapshot = json.dumps({"signal": signal, "nobitex": venue, "btc_context": btc_context},
                               sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        snapshot_path = self.model_path.with_name(f"spot_data_{run_id}.json.gz")
+        snapshot_path = self.store.artifact_dir / f"spot_data_{run_id}.json.gz"
         snapshot_temp = snapshot_path.with_suffix(".tmp")
         snapshot_temp.write_bytes(gzip.compress(snapshot, compresslevel=6))
         snapshot_temp.replace(snapshot_path)
@@ -296,26 +295,21 @@ class SpotPaperService:
                    "btc_context_source": "binance", "feature_policy": "Required actual BTC context; missing context abstains",
                    "run_id": run_id,
                    "trained_at": datetime.now(timezone.utc).isoformat()}
-        self.model_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact = self.model_path.with_name(f"spot_model_{run_id}.joblib")
+        artifact = self.store.artifact_dir / f"spot_model_{run_id}.joblib"
         temporary = artifact.with_suffix(".tmp")
         joblib.dump(package, temporary)
         temporary.replace(artifact)
         result["paper_model"] = {k: v for k, v in package.items() if k != "models"}
         result["model_artifact"] = artifact.name
         result["model_file_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        with self.lock:
-            with self.model_lock:
-                latest_temp = self.model_path.with_suffix(".tmp")
-                shutil.copyfile(artifact, latest_temp)
-                latest_temp.replace(self.model_path)
-            self.store.put("spot_experiments", run_id, result)
-            self.store.put("spot_manager", "research", result)
-            runs = self.store.get("spot_manager", "experiments", [])
+        with self.lock, self.store.write_transaction() as conn:
+            self.store.write(conn, "spot_experiments", run_id, result)
+            self.store.write(conn, "spot_manager", "research", result)
+            runs = self.store.read(conn, "spot_manager", "experiments", [])
             runs.append({"run_id": run_id, "selected": method, "passed": result["validation_outcome"]["passed"],
                          "data_hash": result["data_hash"], "code_hash": result["code_hash"],
                          "windows": result["windows"]})
-            self.store.put("spot_manager", "experiments", runs)
+            self.store.write(conn, "spot_manager", "experiments", runs)
         return result
 
     def tick(self):
@@ -344,10 +338,11 @@ class SpotPaperService:
     def _tick(self, state, generation):
         if state.get("signal_model") == spot_kronos.MODEL:
             return self._tick_kronos(state, generation)
-        if not self.model_path.exists():
+        path = self.model_path
+        if not path.exists():
             return {"ok": False, "reason": "Run historical research before paper decisions"}
         with self.model_lock:
-            package = joblib.load(self.model_path)
+            package = joblib.load(path)
         if package["version"] != RESEARCH_VERSION:
             return {"ok": False, "reason": "Model version mismatch"}
         end = int(time.time() // 3600 * 3600)

@@ -35,6 +35,9 @@ pandas==2.3.3
 pillow==11.0.0
 pluggy==1.6.0
 plyer==2.1.0
+psycopg==3.3.9
+psycopg-binary==3.3.9
+psycopg-pool==3.3.1
 pycparser==2.23
 pydantic==2.13.4
 pydantic_core==2.46.4

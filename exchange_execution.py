@@ -41,18 +41,37 @@ class OrderExecutor:
     async def call(self, method, *args, **kwargs):
         return await asyncio.to_thread(getattr(self.client, method), *args, **kwargs)
 
+    async def mutate_exchange(self, method, *args, **kwargs):
+        def send():
+            self.store.require_runtime()
+            return getattr(self.client, method)(*args, **kwargs)
+
+        return await asyncio.to_thread(send)
+
     def save(self, intent):
         # Resolution and its resulting runtime must survive (or roll back) together.
         intent['updated_at'] = datetime.now(timezone.utc).isoformat()
-        with self.store.connection() as conn:
-            self.store.write(conn, "orders", intent["client_order_id"], intent)
-            position = intent.get("exchange_position", {})
-            if position_is_settled(position, in_past=intent.get("settlement_from_history", False)):
-                self.store.write(conn, "closed_positions", f"{self.account}:{position['id']}",
-                                 {"bot_id": self.bot.id, "position": position})
-            runtime_key, snapshot = self.bot.runtime_record()
-            self.store.write(conn, "runtime", runtime_key, snapshot)
-            self._audit(intent, conn)
+        with self.store.write_transaction() as conn:
+            self._save_order(conn, intent)
+
+    def _save_order(self, conn, intent):
+        self.store.write(conn, "orders", intent["client_order_id"], intent)
+        position = intent.get("exchange_position", {})
+        if position_is_settled(position, in_past=intent.get("settlement_from_history", False)):
+            self.store.write(conn, "closed_positions", f"{self.account}:{position['id']}",
+                             {"bot_id": self.bot.id, "position": position})
+        runtime_key, snapshot = self.bot.runtime_record()
+        self.store.write(conn, "runtime", runtime_key, snapshot)
+        self._audit(intent, conn)
+
+    def _reject_unsent(self, intent):
+        with self.store.write_transaction() as conn:
+            saved = self.store.read(conn, "orders", intent["client_order_id"])
+            if saved and saved["state"] == "prepared":
+                # Only a still-prepared intent can be marked as never sent.
+                intent["state"] = "rejected"
+                intent["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_order(conn, intent)
 
     def _audit(self, intent, conn):
         detail = json.dumps({key: intent.get(key) for key in
@@ -101,31 +120,28 @@ class OrderExecutor:
         intent["position_direction"] = self._direction(intent)
         intent["side"] = self._execution_side(intent)
         intent['updated_at'] = intent['created_at']
-        # SQLite write lock makes market reservation and intent insertion atomic.
-        with self.store.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            for (raw,) in conn.execute("SELECT value FROM records WHERE namespace='orders'"):
-                other = json.loads(raw)
+        # The scope's transaction lock serializes reservations, including empty markets.
+        with self.store.write_transaction() as conn:
+            for other in self.store.records(conn, "orders").values():
                 if (other["account"] == self.account and other["src"] == src and other["dst"] == dst
                         and other["state"] not in ("resolved", "rejected")):
                     raise RuntimeError("Market reserved by an unresolved order")
             if kind == "open":
                 market = f"{src}{dst}".lower()
-                for (raw,) in conn.execute("SELECT value FROM records WHERE namespace='runtime'"):
-                    runtime = json.loads(raw)
+                for runtime in self.store.records(conn, "runtime").values():
                     for owned in [runtime, *runtime.get("side_runtimes", {}).values()]:
                         position_id = owned.get("_exchange_position_id")
                         if (owned.get("_account") == self.account and owned.get("market") == market
                                 and position_id is not None):
                             position = {"id": position_id, "side": "buy" if owned.get("_real_state") == "long" else "sell"}
-                            if not self.bot.can_share_position(position):
+                            if not self.bot.can_share_position(position, conn=conn):
                                 raise RuntimeError("Market is already owned by a bot")
             self.store.write(conn, "orders", intent["client_order_id"], intent)
             self._audit(intent, conn)
         return intent
 
     async def open(self, src, dst, side, amount, price, leverage, timeout=300):
-        if self.bot.unresolved_intents():
+        if await asyncio.to_thread(self.bot.unresolved_intents):
             raise RuntimeError("Unresolved order must be reconciled before submission")
         active = await self.call("positions", "active")
         if any(p.get("srcCurrency") == src and p.get("dstCurrency") == dst and p.get("status") == "Open"
@@ -133,7 +149,7 @@ class OrderExecutor:
             raise RuntimeError("Market has an existing position; assign ownership and reconcile first")
         payload = dict(src_currency=src, dst_currency=dst, side=side, amount=amount,
                        price=price, leverage=leverage, execution="market")
-        intent = self._new("open", src, dst, side, payload, [p["id"] for p in active])
+        intent = await asyncio.to_thread(self._new, "open", src, dst, side, payload, [p["id"] for p in active])
         await self.submit(intent)
         await self.poll(intent, timeout)
         if float(intent["exchange_order"].get("matchedAmount") or 0) <= 0:
@@ -142,28 +158,24 @@ class OrderExecutor:
         return [position] if position and position.get("status") == "Open" else []
 
     async def close(self, position_id, amount, price, timeout=120):
-        if self.bot.unresolved_intents():
-            await self.reconcile()
-            if self.bot.unresolved_intents():
-                return False
+        if await asyncio.to_thread(self.bot.unresolved_intents) and not await self.reconcile():
+            return False
         src, dst = self.bot._parse_symbol()
-        if self.store.owner(self.account, position_id) != self.bot.id:
+        if await asyncio.to_thread(self.store.owner, self.account, position_id) != self.bot.id:
             raise RuntimeError("Cannot close an unowned position")
         payload = dict(position_id=position_id, amount=amount, price=price, execution="market")
         if self.bot._real_state not in ("long", "short"):
             raise RuntimeError("Owned position direction is unavailable")
-        intent = self._new("close", src, dst, self.bot._real_state, payload, [position_id])
+        intent = await asyncio.to_thread(self._new, "close", src, dst, self.bot._real_state, payload, [position_id])
         await self.submit(intent)
         await self.poll(intent, timeout)
         return intent["state"] == "resolved" and self.bot._exchange_position_id is None
 
-    async def submit(self, intent):
+    def _mark_submitted(self, intent):
+        self.store.require_runtime()
         # Mark before network I/O. A crash here stays uncertain rather than replaying.
-        with self.store.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT value FROM records WHERE namespace='orders' AND key=?",
-                               (intent["client_order_id"],)).fetchone()
-            saved = json.loads(row[0]) if row else None
+        with self.store.write_transaction() as conn:
+            saved = self.store.read(conn, "orders", intent["client_order_id"])
             if not saved or saved["state"] != "prepared":
                 raise RuntimeError("Order already submitted or no durable prepared intent")
             if saved["account"] != self.account or saved["bot_id"] != self.bot.id:
@@ -176,11 +188,15 @@ class OrderExecutor:
             runtime_key, snapshot = self.bot.runtime_record()
             self.store.write(conn, "runtime", runtime_key, snapshot)
             self._audit(intent, conn)
+
+    async def submit(self, intent):
+        await asyncio.to_thread(self._mark_submitted, intent)
         try:
             if intent["kind"] == "open":
-                order = await self.call("open_margin_order", **intent["payload"], client_order_id=intent["client_order_id"])
+                order = await self.mutate_exchange("open_margin_order", **intent["payload"],
+                                                   client_order_id=intent["client_order_id"])
             else:
-                order = await self.call("close_position", **intent["payload"])
+                order = await self.mutate_exchange("close_position", **intent["payload"])
             if order.get("id") is None:
                 raise RuntimeError("Exchange returned no order ID")
         except BaseException as exc:
@@ -193,7 +209,7 @@ class OrderExecutor:
             intent["state"] = "rejected" if rejected else "uncertain"
             reason = str(exc) if isinstance(exc, NobitexAPIError) else type(exc).__name__
             intent["last_error"] = reason
-            self.save(intent)
+            await asyncio.to_thread(self.save, intent)
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if rejected:
@@ -205,7 +221,7 @@ class OrderExecutor:
         self.bot._pending_order = dict(order_id=order["id"], side=intent["side"],
                                        amount=float(intent["payload"]["amount"]), price=float(intent["payload"]["price"]),
                                        placed_at=intent["created_at"], matched_pct=0)
-        self.save(intent)
+        await asyncio.to_thread(self.save, intent)
 
     async def poll(self, intent, timeout):
         deadline = time.monotonic() + timeout
@@ -216,8 +232,9 @@ class OrderExecutor:
                 if not _transient_read_error(exc):
                     raise
                 intent["last_check_error"] = type(exc).__name__
-                self.save(intent)
-                self.bot._log_event("warning", f"Order #{intent.get('order_id')} status temporarily unavailable ({type(exc).__name__})")
+                await asyncio.to_thread(self.save, intent)
+                await asyncio.to_thread(self.bot._log_event, "warning",
+                                        f"Order #{intent.get('order_id')} status temporarily unavailable ({type(exc).__name__})")
             if intent["state"] == "resolved":
                 return
             if time.monotonic() >= deadline:
@@ -225,7 +242,7 @@ class OrderExecutor:
                 # until the exchange confirms terminal state.
                 status = intent.get("exchange_order", {}).get("status", "").lower()
                 if intent.get("order_id") and status not in ("done", "canceled", "cancelled", "rejected"):
-                    await self.call("cancel_order", intent["order_id"])
+                    await self.mutate_exchange("cancel_order", intent["order_id"])
                     await self.refresh(intent)
                 if intent["state"] != "resolved":
                     raise RuntimeError("Order still unresolved after timeout; reconciliation required")
@@ -240,18 +257,17 @@ class OrderExecutor:
         intent["side"] = self._execution_side(intent)
         if not intent.get("order_id"):
             if intent["state"] == "prepared":
-                intent["state"] = "rejected"  # no network call began
-                self.save(intent)
+                await asyncio.to_thread(self._reject_unsent, intent)
                 return
             if intent["kind"] == "close":
                 position = await self._close_position(intent)
                 if await self._settled(intent, position):
                     intent["state"] = "resolved"
                     self._clear_owned()
-                    self.save(intent)
+                    await asyncio.to_thread(self.save, intent)
                 else:
                     intent["exchange_position"] = position
-                    self.save(intent)
+                    await asyncio.to_thread(self.save, intent)
                 return
             try:
                 found = await self.call("order_by_client_id", intent["client_order_id"])
@@ -260,7 +276,7 @@ class OrderExecutor:
             if not found.get("id"):
                 return
             intent["order_id"] = found["id"]
-            self.save(intent)
+            await asyncio.to_thread(self.save, intent)
         info = await self.call("order_status", intent["order_id"])
         intent["exchange_order"] = info
         amount, matched = float(info.get("amount") or intent["payload"]["amount"]), float(info.get("matchedAmount") or 0)
@@ -269,7 +285,7 @@ class OrderExecutor:
                                        placed_at=intent["created_at"],
                                        matched_pct=round(100 * matched / amount, 1) if amount else 0)
         # Preserve actual fees/fills even if the subsequent position query fails.
-        self.save(intent)
+        await asyncio.to_thread(self.save, intent)
         terminal = info.get("status", "").lower() in ("done", "canceled", "cancelled", "rejected")
         if intent["kind"] == "open" and matched > 0:
             position_id = info.get("positionId") or intent.get("exchange_position", {}).get("id")
@@ -282,12 +298,12 @@ class OrderExecutor:
                         or position.get("dstCurrency") != intent["dst"]
                         or position.get("side") != intent["side"]):
                     raise RuntimeError("Exchange position does not match the recorded open order")
-                self.store.claim_position(self.account, position["id"], self.bot.id)
+                await asyncio.to_thread(self.store.claim_position, self.account, position["id"], self.bot.id)
                 intent["exchange_position"] = position
                 if terminal and await self._settled(intent, position):
                     intent["state"] = "resolved"
                     self._clear_owned()
-                    self.save(intent)
+                    await asyncio.to_thread(self.save, intent)
                     return
                 matches = [position] if position.get("status") == "Open" else []
             else:
@@ -297,10 +313,10 @@ class OrderExecutor:
                            and p.get("status") == "Open" and p["id"] not in intent["existing_ids"]]
             if len(matches) != 1:
                 intent["state"] = "awaiting_position"
-                self.save(intent)
+                await asyncio.to_thread(self.save, intent)
                 return
             position = matches[0]
-            self.store.claim_position(self.account, position["id"], self.bot.id)
+            await asyncio.to_thread(self.store.claim_position, self.account, position["id"], self.bot.id)
             self.bot._exchange_position_id = position["id"]
             self.bot._real_state = "long" if position["side"] == "buy" else "short"
             self.bot._real_positions = self.bot._normalize_positions([position])
@@ -324,17 +340,17 @@ class OrderExecutor:
                 self._clear_owned()
             elif position.get("status") != "Open":
                 intent["state"] = "awaiting_settlement"
-                self.save(intent)
+                await asyncio.to_thread(self.save, intent)
                 return
             # Done order with still-open position may be partial; no reopening.
         intent["state"] = "resolved" if terminal else "partial" if matched else "acknowledged"
         if terminal:
             self.bot._pending_order = None
-        self.save(intent)
+        await asyncio.to_thread(self.save, intent)
 
     async def _close_position(self, intent):
         position_id = intent["payload"]["position_id"]
-        if self.store.owner(self.account, position_id) != self.bot.id:
+        if await asyncio.to_thread(self.store.owner, self.account, position_id) != self.bot.id:
             raise RuntimeError("Cannot reconcile an unowned position")
         position = await self.call("position", position_id)
         expected_side = "buy" if self._direction(intent) == "long" else "sell"
@@ -346,10 +362,10 @@ class OrderExecutor:
         return position
 
     async def reconcile(self):
-        for intent in self.bot.unresolved_intents():
+        for intent in await asyncio.to_thread(self.bot.unresolved_intents):
             await self.refresh(intent)
-        self.bot._persist()
-        return not self.bot.unresolved_intents()
+        await asyncio.to_thread(self.bot._persist)
+        return not await asyncio.to_thread(self.bot.unresolved_intents)
 
     async def bind_order(self, client_order_id, order_id):
         """Bind an uncertain local intent to an operator-supplied exchange order.
@@ -359,12 +375,12 @@ class OrderExecutor:
         """
         if not isinstance(order_id, int) or isinstance(order_id, bool) or order_id <= 0:
             raise ValueError("A positive exchange order ID is required")
-        intent = self.store.get("orders", client_order_id)
+        intent = await asyncio.to_thread(self.store.get, "orders", client_order_id)
         if not intent or intent.get("bot_id") != self.bot.id or intent.get("account") != self.account:
             raise ValueError("Unknown order intent")
         if intent.get("state") in ("resolved", "rejected"):
             raise ValueError("Order intent is already resolved")
-        for other in self.store.list("orders").values():
+        for other in (await asyncio.to_thread(self.store.list, "orders")).values():
             if (other.get("account") == self.account and other.get("order_id") == order_id
                     and other.get("client_order_id") != client_order_id):
                 raise ValueError("Exchange order is already bound to another intent")
@@ -398,6 +414,6 @@ class OrderExecutor:
             "bound_at": datetime.now(timezone.utc).isoformat(),
             "validated_by": "client_order_id" if exchange_client_id else "market-side-amount-time",
         }
-        self.save(intent)
+        await asyncio.to_thread(self.save, intent)
         await self.refresh(intent)
         return intent["state"] == "resolved"

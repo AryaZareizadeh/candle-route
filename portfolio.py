@@ -106,13 +106,12 @@ class PortfolioHistory:
 
     def save_snapshot(self, snapshot):
         with self.store.connection() as conn:
-            conn.execute("INSERT OR REPLACE INTO portfolio_snapshots VALUES(?,?,?,?)",
-                         (snapshot["captured_at"], snapshot["equity_usdt"],
-                          int(snapshot["valuation_complete"]), json.dumps(snapshot, allow_nan=False)))
+            self.store.upsert_snapshot(conn, snapshot["captured_at"], snapshot["equity_usdt"],
+                                       int(snapshot["valuation_complete"]), json.dumps(snapshot, allow_nan=False))
 
     def snapshots(self, limit=5000):
         with self.store.connection() as conn:
-            rows = conn.execute("SELECT data FROM portfolio_snapshots ORDER BY captured_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.store.latest_snapshots(conn, limit).fetchall()
         return [json.loads(row[0]) for row in reversed(rows)]
 
     def add_flow(self, amount_usdt, occurred_at=None, note=""):
@@ -121,37 +120,32 @@ class PortfolioHistory:
             raise ValueError("Cash flow must be nonzero")
         when = _utc(occurred_at)
         with self.store.connection() as conn:
-            cursor = conn.execute("INSERT INTO portfolio_cashflows(occurred_at,amount_usdt,note) VALUES(?,?,?)",
-                                  (when, amount, note[:120]))
-            return cursor.lastrowid
+            return self.store.insert_cashflow(conn, when, amount, note[:120])
 
     def delete_flow(self, flow_id):
         with self.store.connection() as conn:
-            return conn.execute("DELETE FROM portfolio_cashflows WHERE id=?", (flow_id,)).rowcount > 0
+            return self.store.remove_cashflow(conn, flow_id)
 
     def flows(self):
         with self.store.connection() as conn:
-            rows = conn.execute("SELECT id,occurred_at,amount_usdt,note FROM portfolio_cashflows ORDER BY occurred_at,id").fetchall()
+            rows = list(self.store.cashflows(conn))
         return [dict(id=r[0], occurred_at=r[1], amount_usdt=r[2], note=r[3]) for r in rows]
 
     def performance(self):
         # Use one consistent read snapshot and stream every observation. Only
         # chart output is sampled; the baseline and accounting never roll away.
-        with self.store.connection() as conn:
-            conn.execute("BEGIN")
-            count = conn.execute("SELECT COUNT(*) FROM portfolio_snapshots WHERE valuation_complete=1").fetchone()[0]
+        with self.store.read_snapshot() as conn:
+            count = self.store.complete_snapshot_count(conn)
             if not count:
                 return {"points": [], "return_pct": None, "net_pnl_usdt": None,
                         "max_drawdown_pct": None, "period_start": None, "period_end": None}
-            flows = [(datetime.fromisoformat(at), amount) for at, amount in conn.execute(
-                "SELECT occurred_at,amount_usdt FROM portfolio_cashflows ORDER BY occurred_at,id")]
+            flows = [(datetime.fromisoformat(at), amount) for _, at, amount, _ in self.store.cashflows(conn)]
             stride = max(1, math.ceil((count - 1) / 499))
             points, base, previous = [], None, None
             growth = peak = 1.0
             max_dd = net_flows = 0.0
             flow_index = 0
-            for index, (raw,) in enumerate(conn.execute(
-                    "SELECT data FROM portfolio_snapshots WHERE valuation_complete=1 ORDER BY captured_at")):
+            for index, (raw,) in enumerate(self.store.complete_snapshots(conn)):
                 current = json.loads(raw)
                 t1 = datetime.fromisoformat(current["captured_at"])
                 if base is None:

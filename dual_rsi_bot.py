@@ -38,12 +38,16 @@ class _SideBot(Bot):
         # Order resolution and both accounts are committed in the same transaction.
         return self.parent.id, self.parent.snapshot()
 
-    def can_share_position(self, position):
+    def can_share_position(self, position, *, conn=None):
         other = self.parent.sides["short" if self.side == "long" else "long"]
         expected = "sell" if self.side == "long" else "buy"
-        return (position.get("side") == expected and position.get("id") == other._exchange_position_id
-                and self._store is not None
-                and self._store.owner(self._account_key(), position["id"]) == other.id)
+        if (position.get("side") != expected or position.get("id") != other._exchange_position_id
+                or self._store is None):
+            return False
+        account = self._account_key()
+        owner = (self._store.owner(account, position["id"]) if conn is None
+                 else self._store.position_owner(conn, account, position["id"]))
+        return owner == other.id
 
     async def _sync_exchange(self):
         # Serialize submissions within this bot so each sees the other's latest fill.

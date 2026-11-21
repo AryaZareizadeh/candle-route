@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 
 from runtime_lease import FileLease
+from postgres import get_database
 
 
 def forecast_workspace(account_dir):
@@ -19,11 +20,18 @@ def account_dir(root, username):
     root = Path(root).resolve()
     if username is None:
         return root
-    database = root / "accounts.sqlite3"
-    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
-        row = connection.execute(
-            "SELECT id FROM users WHERE username=? AND verified=1", (username,)
-        ).fetchone()
+    database = get_database()
+    if database is not None:
+        with database.connection() as connection:
+            row = connection.execute(
+                'SELECT id FROM users WHERE lower(username COLLATE "C")=lower(%s COLLATE "C") AND verified=1',
+                (username,)).fetchone()
+    else:
+        path = root / "accounts.sqlite3"
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+            row = connection.execute(
+                "SELECT id FROM users WHERE username=? AND verified=1", (username,)
+            ).fetchone()
     if not row or not re.fullmatch("[0-9a-f]{32}", row[0]):
         raise ValueError("Choose a verified CandleRoute account.")
     return root / "users" / row[0]
@@ -63,6 +71,9 @@ def import_forecasting(source, root, username=None, *, exclude_runs=()):
     if not source.is_dir():
         raise ValueError("Forecasting source directory does not exist.")
     with ExitStack() as stack:
+        database = get_database()
+        if database is not None:
+            stack.enter_context(database.runtime_lease())
         stack.enter_context(FileLease(root / ".dashboard.lock"))
         target = forecast_workspace(account_dir(root, username))
         if target.resolve() != target:

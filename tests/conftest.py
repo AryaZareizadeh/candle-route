@@ -8,10 +8,37 @@ os.environ["TRADER_DATA_DIR"] = _session_dir.name
 os.environ["TRADER_ENV_FILE"] = str(Path(_session_dir.name) / ".env")
 os.environ["TRADER_OFFLINE"] = "true"
 for _key in tuple(os.environ):
-    if _key.startswith("NOBITEX_"):
+    if _key.startswith("NOBITEX_") or _key == "TRADER_DATABASE_URL":
         os.environ.pop(_key)
 
 import pytest
+
+
+@pytest.fixture
+def postgres_database(monkeypatch):
+    """Create a fresh database. The configured database itself is never modified."""
+    dsn = os.getenv("CANDLE_TEST_POSTGRES_URL")
+    if not dsn:
+        pytest.skip("Set CANDLE_TEST_POSTGRES_URL to enable PostgreSQL integration tests")
+    from uuid import uuid4
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    from postgres import get_database
+
+    name = f"candle_test_{uuid4().hex}"
+    identifier = sql.Identifier(name)
+    with psycopg.connect(dsn, connect_timeout=5, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(identifier))
+        monkeypatch.setenv("TRADER_DATABASE_URL", make_conninfo(dsn, dbname=name))
+        database = get_database()
+        try:
+            yield database
+        finally:
+            database.close()
+            admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(identifier))
 
 
 @pytest.fixture(autouse=True)

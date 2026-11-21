@@ -42,7 +42,7 @@ def trainer_router(manager, request_model):
         if manager.get_model(model_id) is None:
             return JSONResponse(status_code=404, content={"error": "Saved model not found"})
         try:
-            return await PREDICTION.run(str(manager.store.path.resolve()), manager.predict, model_id)
+            return await PREDICTION.run(manager.store.workspace_id, manager.predict, model_id)
         except ResearchBusy as exc:
             return JSONResponse(status_code=429, content={"error": str(exc)})
         except ValueError as exc:

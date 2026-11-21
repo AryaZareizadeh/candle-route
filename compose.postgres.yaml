@@ -1,0 +1,26 @@
+# docker compose --env-file docker.env -f compose.yaml -f compose.postgres.yaml up -d
+services:
+  dashboard:
+    environment:
+      TRADER_DATABASE_URL: "postgresql://candle_route:${CANDLE_POSTGRES_PASSWORD:?Set a hex CANDLE_POSTGRES_PASSWORD in docker.env}@postgres:5432/candle_route"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17.12
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: candle_route
+      POSTGRES_USER: candle_route
+      POSTGRES_PASSWORD: "${CANDLE_POSTGRES_PASSWORD:?Set a hex CANDLE_POSTGRES_PASSWORD in docker.env}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "candle_route", "-d", "candle_route"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  postgres_data:

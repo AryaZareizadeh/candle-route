@@ -25,7 +25,7 @@ class BotManager:
             runner._tenant_account_id = self.account_id
             runner._testnet_factory = self.testnet_factory
             runner._store = self.store
-            runner._model_dir = self.store.path.parent / "models"
+            runner._model_dir = self.store.artifact_dir / "models"
             if validate_model:
                 runner._validate_saved_model()
         return bot
@@ -35,7 +35,7 @@ class BotManager:
         return self._store or get_store()
 
     def _save(self, archived_trades=None):
-        with self.store.connection() as conn:
+        with self.store.write_transaction() as conn:
             for key, record in (archived_trades or {}).items():
                 if record['status'] == 'open':
                     record = dict(record, status='reset')
@@ -54,7 +54,7 @@ class BotManager:
             configs = [BotConfig(**item) for item in imports.get("bots", [])]
             for cfg in configs:
                 make_bot(cfg)
-            with self.store.connection() as conn:
+            with self.store.write_transaction() as conn:
                 for cfg in configs:
                     self.store.write(conn, "bots", cfg.id, asdict(cfg))
                 for name in ("tester", "optimizer"):
@@ -84,7 +84,7 @@ class BotManager:
     def create_bot(self, cfg):
         bot = self._configure_bot(make_bot(cfg))
         bot._store = self.store
-        with self.store.connection() as conn:
+        with self.store.write_transaction() as conn:
             self._record_creation(bot, conn)
             self.store.write(conn, "bots", bot.id, asdict(bot.cfg))
             self.store.write(conn, "runtime", bot.id, bot.snapshot())
@@ -102,7 +102,7 @@ class BotManager:
     def create_bots(self, configs):
         """Validate and persist a group atomically before exposing any of its bots."""
         bots = [self._configure_bot(make_bot(cfg)) for cfg in configs]
-        with self.store.connection() as conn:
+        with self.store.write_transaction() as conn:
             for bot in bots:
                 self._record_creation(bot, conn)
                 self.store.write(conn, "bots", bot.id, asdict(bot.cfg))
@@ -156,8 +156,9 @@ class BotManager:
         bot = self._bots.get(bot_id)
         if bot and (bot.has_owned_position() or bot.unresolved_intents()):
             raise ValueError("Cannot delete a bot with an owned position or unresolved order")
-        with self.store.connection() as conn:
-            conn.execute("DELETE FROM records WHERE namespace IN ('bots','runtime') AND key=?", (bot_id,))
+        with self.store.write_transaction() as conn:
+            self.store.erase(conn, "bots", bot_id)
+            self.store.erase(conn, "runtime", bot_id)
         self._bots.pop(bot_id, None)
 
     def get_all_states(self):

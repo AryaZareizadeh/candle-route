@@ -37,31 +37,32 @@ python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_b
 
 Put the generated value in `TRADER_MASTER_KEY` in `docker.env`. Set a long random
 `TRADER_INVITE_CODE` and fill in `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
-`SMTP_PASSWORD`, and `SMTP_FROM`. The mail server must support TLS. Then run:
+`SMTP_PASSWORD`, and `SMTP_FROM`. The mail server must support TLS. For PostgreSQL,
+generate a hex password and save it as `CANDLE_POSTGRES_PASSWORD` in `docker.env`.
+For an existing deployment, follow the [migration runbook](docs/operations.md#existing-sqlite-deployment)
+before starting the dashboard against PostgreSQL. For a fresh deployment, run:
 
 ```powershell
-docker compose up --build -d
-docker compose ps
+docker compose --env-file docker.env -f compose.yaml -f compose.postgres.yaml up --build -d
+docker compose --env-file docker.env -f compose.yaml -f compose.postgres.yaml ps
 ```
 
-The default image includes CPU forecasting. For CUDA, add `-f compose.yaml -f compose.cuda.yaml`
+The default image includes CPU forecasting. For CUDA, add `-f compose.cuda.yaml`
 to the Compose command. To provision original weights for a verified account, stop the
-dashboard and run `docker compose run --rm --no-deps dashboard python main.py setup-kronos --username USERNAME`.
+dashboard and run `run --rm --no-deps dashboard python main.py setup-kronos --username USERNAME`
+with the same Compose files.
 Then start the dashboard again. Add `--model kronos-base` for the larger forecasting model.
 
-After updating the source, back up `trader_data` and `docker.env` as described
-under [operations](docs/operations.md), then run
-`docker compose up --build -d dashboard`. The image copies the new Portfolio tab and SQLite migration; the
-existing named volume keeps each user's history. Open **Portfolio** after signing
-in to take the first complete snapshot. If real bots were running, inspect their
-saved positions and unresolved orders before restarting them.
+Before updating an existing deployment, make a coordinated database and artifact
+backup as described under [operations](docs/operations.md). If real bots were
+running, inspect their saved positions and unresolved orders before restarting them.
 
 Open [the local dashboard](http://127.0.0.1:8011), create an account with the
 invitation code, confirm the emailed code, and sign in. Other users can register
 the same way. Password recovery sends an eight-digit one-time code to the verified
-email address. The account database and per-user trading databases live in the
-`trader_data` Docker volume. Back up that volume and `docker.env` together;
-losing `TRADER_MASTER_KEY` makes saved exchange credentials unreadable.
+email address. PostgreSQL stores the account and trading tables in `postgres_data`.
+The `trader_data` volume holds private model and forecasting files. Back up both
+and keep `TRADER_MASTER_KEY` from `docker.env` separately.
 
 The Compose port is bound to host loopback. For remote access, put an HTTPS reverse
 proxy in front of it, set `DASHBOARD_ALLOWED_HOSTS` to the exact public hostname,
@@ -74,7 +75,7 @@ and verify its owner's new account, but do not sign in yet. Stop the Compose
 dashboard, mount that backup read-only into a one-off container, and run
 `python main.py import-legacy --username USERNAME --source PATH` there with the
 same `TRADER_MASTER_KEY` and old exchange credentials available in the container
-environment. The command copies the database into that user's directory and
+environment. The command copies the trading data into that user's account and
 retains the source. Start Compose again, then inspect saved positions and
 unresolved orders before starting any real bot. See
 [operations](docs/operations.md) for recovery details.
@@ -293,13 +294,16 @@ globally to future runs, so select the intended market before saving.
 
 ## Storage and configuration
 
-The default runtime directory is `.runtime` next to the source. SQLite stores bot
-configuration and recoverable runtime state. Existing `bots.json`, `tester.json`
-and `optimizer.json` are migration inputs; keep originals as backups.
+The default runtime directory is `.runtime` next to the source. With
+`TRADER_DATABASE_URL` configured, PostgreSQL stores recoverable application state.
+Leaving the URL unset selects SQLite. Keep the runtime directory for model files,
+forecasting workspaces and artifacts. Existing `bots.json`, `tester.json` and
+`optimizer.json` are legacy inputs.
 
 | Setting | Purpose |
 | --- | --- |
-| `TRADER_DATA_DIR` | Absolute directory for database and runtime lock |
+| `TRADER_DATA_DIR` | Absolute directory for runtime artifacts, local locks, and legacy databases |
+| `TRADER_DATABASE_URL` | PostgreSQL URL for Candle Route state |
 | `TRADER_ENV_FILE` | Absolute environment-file path; defaults to repository `.env` |
 | `TRADER_HOST`, `TRADER_PORT` | Launcher bind address and port; default `127.0.0.1:8011` |
 | `DASHBOARD_PASSWORD_HASH` | Legacy single-user mode; created by `main.py setup-password` |
@@ -327,18 +331,18 @@ preserving its viewport and following new bars when already viewing the latest b
 Cards show the latest public Nobitex price separately from the last candle close.
 While a dashboard with bots is connected, one shared fetcher requests all market
 stats at most once every 10 seconds (six requests per minute). Bots, users, tabs,
-and processes sharing `TRADER_DATA_DIR` reuse `market-quotes.sqlite3` and its OS
-lease. Poll reservations and rate-limit cooldowns survive restarts. HTTP 429
+and processes sharing a deployment reuse its quote store and refresh lease.
+Poll reservations and rate-limit cooldowns survive restarts. HTTP 429
 responses honor `Retry-After`; other failures back off, retaining the last good
 quote with its age and a stale label. Display quotes do not change strategy inputs
 or order prices. `TRADER_OFFLINE=true` disables automatic quote fetching.
 
 ## Shared candle history
 
-All candle downloads share a persistent SQLite database at
-`TRADER_DATA_DIR/candles.sqlite3` (by default `.runtime/candles.sqlite3`; `/data/candles.sqlite3`
-in Docker). Bots, backtests, the optimizer, model training, and portfolio research
-reuse the same public market history across features, users, and restarts.
+Trading, backtests, the optimizer, the model trainer, and portfolio research reuse
+one persistent candle store across users and restarts. It uses PostgreSQL when
+configured and `TRADER_DATA_DIR/candles.sqlite3` in SQLite mode. Standalone
+forecasting keeps its CSV datasets and provenance in its workspace.
 
 Each candle stores its exchange, instrument, timeframe, actual opening timestamp,
 exclusive closing boundary, Open, High, Low, Close, Volume, and source metadata.

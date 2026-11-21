@@ -1,13 +1,65 @@
 # Operations and recovery
 
-## Multi-user Docker deployment
+## PostgreSQL deployment
 
-Follow the [Docker setup](../README.md#docker-setup). The named volume contains
-`accounts.sqlite3` and `users/<account-id>/trader.sqlite3`. Back up the whole
-volume and the private `docker.env` containing `TRADER_MASTER_KEY`; restore them
-together. Keep the master key stable across rebuilds and container replacements.
-One container owns the volume at a time. A second container with the same volume
-must not be started, because the per-user runtime locks are local to one host.
+Follow the [Docker setup](../README.md#docker-setup) for a fresh multi-user
+deployment. The PostgreSQL service uses a private Compose network and its own
+`postgres_data` volume. The `trader_data` volume mounts at `/data` and holds models,
+forecasting workspaces and other artifacts. Keep the original `TRADER_MASTER_KEY`
+in private configuration across rebuilds and restores.
+
+For a native Windows installation, create a dedicated PostgreSQL 17 database
+owned by a Candle Route role. Install the PostgreSQL 17 client utilities
+(`pg_dump` and `pg_restore`) on PATH for backups and restores. Configure the
+following in the private environment file, with the password URL-encoded.
+
+```dotenv
+TRADER_DATABASE_URL=postgresql://candle_route:PASSWORD@127.0.0.1:5432/candle_route
+```
+
+Use one dashboard process per database and artifact directory. PostgreSQL
+enforces a deployment lease while the dashboard runs. The liveness endpoint
+`/healthz` reports process health, and `/readyz` checks the PostgreSQL lease.
+
+### Existing SQLite deployment
+
+1. Stop the dashboard so all database and file writers are idle. Preserve a
+   verified SQLite bundle and the private configuration, including the original
+   master key for multi-user deployments. Keep single-user and multi-user mode
+   consistent when moving an entire runtime.
+2. Create a new PostgreSQL database. Set `TRADER_DATABASE_URL` and keep
+   `TRADER_DATA_DIR` pointed at the existing artifact directory. Check the import
+   source and target using `python main.py migrate-postgres --source PATH --dry-run`.
+   `PATH` can be a stopped SQLite runtime directory or a verified SQLite bundle.
+3. Run the same command without `--dry-run`. The importer verifies copied rows
+   and artifact references. An import can also populate a new artifact directory
+   using `--destination`. Use that same directory as `TRADER_DATA_DIR` when serving.
+4. Start the dashboard and check `/readyz`, login and representative account or
+   portfolio history. Review real bots with saved positions or unresolved orders
+   against the exchange before starting them.
+
+For Compose, use the same `--env-file` and `-f` flags as in the README. Stop
+`dashboard`, build the updated image, then start just `postgres` with
+`up -d --wait postgres`. Run the importer in a one-off dashboard container
+with `run --rm --no-deps dashboard python main.py migrate-postgres --source /data`.
+Add `--dry-run` for the first invocation. Start the dashboard after verification.
+
+The source remains available for rollback until PostgreSQL accepts application
+writes. After that, stop the dashboard and preserve the PostgreSQL state before
+considering a rollback. Reconcile changes against the exchange before starting
+any real bot on the old database.
+
+### PostgreSQL backup and restore
+
+Stop the dashboard, then run `python main.py backup-bundle --output PATH`
+using the same database URL and artifact directory. Run
+`python main.py verify-bundle --source PATH` to verify the archive manifest.
+For a restore drill or recovery, set `TRADER_DATABASE_URL` to a new empty database
+and run `python main.py restore-bundle --source PATH --destination NEW_DIRECTORY`.
+Restore bundles from a trusted Candle Route deployment.
+Keep the matching master key separately and point the dashboard at the restored
+database and directory together. The `backup` command produces a database-only
+dump.
 
 SMTP must be configured before inviting users. Signup emails confirm ownership of
 the address, and password reset codes go only to confirmed addresses. If email
@@ -15,11 +67,10 @@ delivery fails, fix SMTP before asking a user to retry; the server never exposes
 the recovery code in its response. Invite codes can be rotated by updating
 `docker.env` and restarting Compose; existing accounts remain usable.
 
-The legacy import command copies the single-operator SQLite database into a
+The legacy import command copies a single-operator SQLite database into a
 verified account and retains its source. Verify the new account's email without
-signing in, then stop the multi-user container before importing; signing in
-creates that account's destination database and prevents an accidental overwrite.
-First stop the old runtime and make a consistent backup with `main.py backup`.
+signing in, then stop the multi-user container before importing. First stop the
+old runtime and make a consistent backup with `main.py backup`.
 Mount the backup read-only into a one-off Compose container and use it as
 `--source`. If the old `.env` holds Nobitex credentials, mount that file
 read-only and set `TRADER_ENV_FILE` to its mount path while running the import
@@ -74,7 +125,7 @@ order** only after locating the exact exchange order ID in Nobitex. The dashboar
 requires the local intent and exchange order to match before binding them. Use
 **Adopt this position** for an existing open position that has no recorded owner.
 
-## Backup
+## Legacy SQLite backup
 
 The backup command uses SQLite's online backup facility, so committed WAL data
 is included. It refuses to overwrite an existing destination:
@@ -95,7 +146,7 @@ Store backups on another protected disk and periodically verify a copy using:
 Expect `ok`. Automated tests verify backup data preservation and destination
 protection with temporary databases.
 
-## Restore
+## Legacy SQLite restore
 
 1. Stop the application and ensure no process is using its database.
 2. Preserve the entire current data directory, including WAL/SHM companions,
@@ -184,6 +235,6 @@ pass `docker compose -p <existing-project-name>` so Compose opens the existing
 the old runtime before the switch. For an isolated trial, restore a backup to a
 separate volume and bind the trial deployment to a different host port.
 
-Each account's `forecasting/` folder is stored beside its `trader.sqlite3`.
+Each account's `forecasting/` folder is stored in its workspace under `TRADER_DATA_DIR`.
 The stopped-runtime bundle includes durable forecasting files. Keep `docker.env`
 and its master key backed up separately.

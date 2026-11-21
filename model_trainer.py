@@ -100,7 +100,7 @@ def validate_config(raw):
 class ModelTrainerManager:
     def __init__(self, store, *, fetcher=None, trainer=None, runtime=None):
         self.store = store
-        self.model_dir = store.path.parent / "models"
+        self.model_dir = store.artifact_dir / "models"
         self._jobs = {}
         self._tasks = {}
         self._cancel = {}
@@ -138,8 +138,18 @@ class ModelTrainerManager:
 
     def _update(self, job_id, **values):
         with self._lock:
-            self._jobs[job_id].update(values)
-            self.store.put("model_training_jobs", job_id, self._jobs[job_id])
+            job = {**self._jobs[job_id], **values}
+            self.store.put("model_training_jobs", job_id, job)
+            self._jobs[job_id] = job
+            return job
+
+    def _publish_model(self, job_id, model_id, metadata, model_ids, progress):
+        with self._lock:
+            job = {**self._jobs[job_id], "model_ids": [*model_ids, model_id], "progress": progress}
+            with self.store.write_transaction() as conn:
+                self.store.write(conn, "trained_models", model_id, metadata)
+                self.store.write(conn, "model_training_jobs", job_id, job)
+            self._jobs[job_id] = job
 
     def list_models(self):
         # The registry belongs to this account's store; paths never come from clients.
@@ -194,7 +204,7 @@ class ModelTrainerManager:
             event = self._cancel.get(job_id)
             if job["status"] not in _TERMINAL and event is not None:
                 event.set()
-                self._update(job_id, stage="cancelling")
+                job = self._update(job_id, stage="cancelling")
             return deepcopy(job)
 
     def _fetch(self, symbol, timeframe, candles, cancel=None):
@@ -206,7 +216,7 @@ class ModelTrainerManager:
 
     async def _run(self, job_id, config):
         try:
-            await TRAINING.run(str(self.store.path.resolve()), self._work, job_id, config,
+            await TRAINING.run(self.store.workspace_id, self._work, job_id, config,
                                cancel=self._cancel[job_id])
         except Exception as exc:
             cancelled = self._cancel[job_id].is_set()
@@ -292,9 +302,9 @@ class ModelTrainerManager:
                     # never been published in the registry.
                     artifact.unlink(missing_ok=True)
                     break
-                self.store.put("trained_models", model_id, metadata)
+                self._publish_model(job_id, model_id, metadata, model_ids,
+                                    round(100 * (pair_index + 1) / pair_count, 2))
                 model_ids.append(model_id)
-                self._update(job_id, model_ids=model_ids[:], progress=round(100 * (pair_index + 1) / pair_count, 2))
             self._update(job_id, status="cancelled" if cancel.is_set() else "done",
                          stage="cancelled" if cancel.is_set() else "done", finished_at=_now())
         finally:

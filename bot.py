@@ -303,7 +303,7 @@ class Bot:
         if self._store is not None:
             from bot_history import save_simulation_history
             key, snapshot = self.runtime_record()
-            with self._store.connection() as conn:
+            with self._store.write_transaction() as conn:
                 save_simulation_history(getattr(self, 'parent', self), conn)
                 self._store.write(conn, "runtime", key, snapshot)
 
@@ -316,7 +316,7 @@ class Bot:
     def has_owned_position(self):
         return any(bot._exchange_position_id is not None for bot in self.execution_bots())
 
-    def can_share_position(self, position):
+    def can_share_position(self, position, *, conn=None):
         return False
 
     def _account_key(self):
@@ -648,7 +648,7 @@ class Bot:
                 self._real_state = "none"
                 self._seed_position = None
                 self._real_positions = []
-                with self._store.connection() as conn:
+                with self._store.write_transaction() as conn:
                     self._store.write(conn, "closed_positions", f"{self._account_key()}:{pos_id}",
                                       {"bot_id": self.id, "position": settled})
                     key, snapshot = self.runtime_record()
@@ -711,7 +711,7 @@ class Bot:
                     self.open_positions = []
                     if self.cfg.strategy_name == AGENTIC_AI_NAME:
                         self._agent_signal = None
-                    with self._store.connection() as conn:
+                    with self._store.write_transaction() as conn:
                         self._store.write(conn, "closed_positions", f"{self._account_key()}:{settled_id}",
                                           {"bot_id": self.id, "position": closed})
                         key, snapshot = self.runtime_record()

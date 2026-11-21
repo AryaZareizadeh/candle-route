@@ -1,7 +1,7 @@
 """Invitation-only multi-user entry point for the trading dashboard."""
 import asyncio
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 import hmac
 import json
@@ -20,7 +20,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import HTTPConnection
 
-from accounts import Accounts, canonical_email
+from accounts import canonical_email, open_accounts
+from postgres import ensure_schema, require_imported_runtime
 from auth import (
     COOKIE, SAFE_METHODS, BoundedAuthWork, AuthWorkBusy, forecast_session_headers,
     frame_options, is_forecast_path,
@@ -160,16 +161,16 @@ class TenantRegistry:
         async with self.lock:
             if user_id in self.tenants:
                 return self.tenants[user_id][0]
-            from storage import Store
+            from storage import open_store
             from bot_manager import BotManager
             from server import create_app
             directory = self.root / "users" / user_id
             credentials = AccountCredentials(self.accounts, user_id)
-            manager = BotManager(store=Store(directory / "trader.sqlite3"), legacy_dir=directory,
+            manager = BotManager(store=open_store(directory / "trader.sqlite3", account_id=user_id), legacy_dir=directory,
                                  account_id=credentials.get().get("account_id", user_id),
                                  testnet_factory=lambda: bool(credentials.get().get("testnet")))
             app = create_app(manager=manager, offline=self.offline, credential_store=credentials,
-                             security=False,
+                             security=False, owns_database_lease=False,
                              optimizer_slots=UserOptimizerSlots(self.optimizer_slots, user_id))
             context = app.router.lifespan_context(app)
             await context.__aenter__()
@@ -304,7 +305,7 @@ def create_multiuser_app(*, data_root=None, offline=None, allowed_hosts=None, se
         raise RuntimeError("TRADER_INVITE_CODE must contain at least 16 characters")
     if send_code is None and (not os.getenv("SMTP_HOST") or not os.getenv("SMTP_FROM")):
         raise RuntimeError("SMTP_HOST and SMTP_FROM are required for multi-user startup")
-    accounts = Accounts(root / "accounts.sqlite3", master_key)
+    accounts = open_accounts(root / "accounts.sqlite3", master_key)
     sessions = SessionRegistry(float(os.getenv("DASHBOARD_SESSION_SECONDS", "43200")))
     tenants = TenantRegistry(accounts, root, offline if offline is not None else
                              os.getenv("TRADER_OFFLINE", "false").lower() == "true")
@@ -317,15 +318,18 @@ def create_multiuser_app(*, data_root=None, offline=None, allowed_hosts=None, se
 
     @asynccontextmanager
     async def lifespan(app):
-        volume_lease.acquire()
-        try:
-            yield
-        finally:
+        database = getattr(accounts, "database", None)
+        with (database.runtime_lease() if database is not None else nullcontext()), volume_lease:
+            if database is not None:
+                require_imported_runtime(database, root, multiuser=True)
+                ensure_schema(database)
             try:
-                await tenants.shutdown()
+                yield
             finally:
-                auth_work.close()
-                volume_lease.release()
+                try:
+                    await tenants.shutdown()
+                finally:
+                    auth_work.close()
 
     app = FastAPI(title="Trading Bot Dashboard", lifespan=lifespan)
     app.add_middleware(MultiAuthMiddleware, sessions=sessions, allowed_hosts=hosts, secure_cookie=secure_cookie)
@@ -341,6 +345,16 @@ def create_multiuser_app(*, data_root=None, offline=None, allowed_hosts=None, se
 
     @app.get("/healthz")
     async def health():
+        return {"ok": True}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readiness():
+        database = getattr(accounts, "database", None)
+        if database is not None:
+            try:
+                await asyncio.to_thread(database.check_ready)
+            except RuntimeError:
+                return JSONResponse({"ok": False}, status_code=503)
         return {"ok": True}
 
     @app.get("/", response_class=HTMLResponse)
@@ -376,8 +390,7 @@ def create_multiuser_app(*, data_root=None, offline=None, allowed_hosts=None, se
         try:
             await auth_work.run(sender, user["email"], code, "registration")
         except Exception:
-            with accounts.connect() as conn:
-                conn.execute("DELETE FROM users WHERE id=? AND verified=0", (user["id"],))
+            await asyncio.to_thread(accounts.discard_unverified, user["id"])
             return JSONResponse({"error": "Could not send confirmation email"}, status_code=503)
         return {"ok": True, "message": "Enter the confirmation code sent to your email"}
 

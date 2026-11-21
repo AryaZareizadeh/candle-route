@@ -33,6 +33,7 @@ from spot_paper import SpotPaperService
 from model_trainer import ModelTrainerManager
 from research_scheduler import SPOT_RESEARCH
 from runtime_lease import FileLease
+from postgres import ensure_schema, require_imported_runtime
 from runtime_status import status_router
 from trainer_routes import trainer_router
 from market_quotes import shared_market_quotes
@@ -190,13 +191,13 @@ class ModelTrainingRequest(BaseModel):
 
 
 def create_app(*, manager=None, exchange_client=None, offline=None, credential_store=None, security=True,
-               optimizer_slots=None, credential_verifier=None, market_quotes=None):
+               optimizer_slots=None, credential_verifier=None, market_quotes=None, owns_database_lease=True):
     """Create an isolated dashboard; tests inject storage/client and disable polling."""
     if offline is None:
         offline = os.getenv("TRADER_OFFLINE", "false").lower() == "true"
     bot_manager = manager or BotManager(legacy_dir=data_dir() if os.getenv("TRADER_DATA_DIR") else None)
     portfolio_history = PortfolioHistory(bot_manager.store)
-    forecast_dir = forecast_workspace(bot_manager.store.path.parent)
+    forecast_dir = forecast_workspace(bot_manager.store.artifact_dir)
     forecasts = ForecastWorkspace(forecast_dir, offline=offline)
     spot_paper = SpotPaperService(bot_manager.store, forecast_workspace=forecast_dir, offline=offline)
     spot_research_task = None
@@ -437,7 +438,21 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = bot_manager.store
-        dashboard_lease = FileLease(store.path.parent / ".dashboard.lock")
+        database = getattr(store, "database", None)
+        if database is not None and owns_database_lease:
+            with database.runtime_lease():
+                require_imported_runtime(database, store.artifact_dir)
+                ensure_schema(database)
+                async with dashboard_lifespan():
+                    yield
+        else:
+            async with dashboard_lifespan():
+                yield
+
+    @asynccontextmanager
+    async def dashboard_lifespan():
+        store = bot_manager.store
+        dashboard_lease = FileLease(store.artifact_dir / ".dashboard.lock")
         dashboard_lease.acquire()
         tasks = []
         try:
@@ -481,6 +496,17 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
 
     # ── App ────────────────────────────────────────────────────────────────────────
     app = FastAPI(title="Trading Bot Dashboard", lifespan=lifespan)
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readiness():
+        database = getattr(bot_manager.store, "database", None)
+        if database is not None:
+            try:
+                await asyncio.to_thread(database.check_ready)
+            except RuntimeError:
+                return JSONResponse({"ok": False}, status_code=503)
+        return {"ok": True}
+
     if security:
         install_auth(app)
     else:
@@ -836,7 +862,7 @@ def create_app(*, manager=None, exchange_client=None, offline=None, credential_s
                     bot_manager.store.put("spot_manager", "research_status", {"status": "running",
                         "started_at": datetime.now(timezone.utc).isoformat()})
                     return spot_paper.research(request.assets, request.days, request.budget_usdt)
-                await SPOT_RESEARCH.run(str(bot_manager.store.path.resolve()), work)
+                await SPOT_RESEARCH.run(bot_manager.store.workspace_id, work)
                 bot_manager.store.put("spot_manager", "research_status", {"status": "complete",
                     "completed_at": datetime.now(timezone.utc).isoformat()})
             except Exception as exc:

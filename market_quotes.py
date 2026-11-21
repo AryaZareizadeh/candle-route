@@ -1,5 +1,5 @@
 """Shared public display quotes, with a durable polling budget across workers."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 import json
@@ -9,6 +9,7 @@ import sqlite3
 import time
 
 from nobitex_http import direct_nobitex_session
+from postgres import DatabaseUnavailable, MIGRATIONS, get_database
 from runtime_lease import FileLease
 from settings import data_dir
 
@@ -18,8 +19,17 @@ class MarketQuotes:
     STALE_SECONDS = 30
     URL = 'https://apiv2.nobitex.ir/market/stats'
 
-    def __init__(self, path, *, clock=None, get=None):
-        self.path = Path(path)
+    def __init__(self, path=None, *, database=None, clock=None, get=None):
+        if path is not None and database is not None:
+            raise ValueError("Choose a SQLite path or PostgreSQL for market quotes")
+        self.database = database
+        if path is None and self.database is None:
+            self.database = get_database()
+        self.path = None
+        if self.database is not None:
+            self.database.migrate('market', MIGRATIONS / 'market')
+        else:
+            self.path = Path(path if path is not None else data_dir() / 'market-quotes.sqlite3')
         self.clock = clock or time.time
         self.session = direct_nobitex_session()
         self.get = get or self.session.get
@@ -28,7 +38,20 @@ class MarketQuotes:
     def _empty():
         return {'quotes': {}, 'next_poll': 0, 'failures': 0}
 
+    def _postgres_snapshot(self, connection):
+        row = connection.execute('SELECT payload FROM market_quotes WHERE id=1').fetchone()
+        return json.loads(row[0]) if row else self._empty()
+
     def snapshot(self):
+        if self.database is not None:
+            from psycopg import Error
+
+            try:
+                with self.database.connection() as connection:
+                    return self._postgres_snapshot(connection)
+            except (Error, DatabaseUnavailable):
+                raise OSError('PostgreSQL market quotes are unavailable') from None
+
         if not self.path.exists():
             return self._empty()
         with closing(sqlite3.connect(self.path, timeout=15)) as connection:
@@ -40,26 +63,48 @@ class MarketQuotes:
                 raise
         return json.loads(row[0]) if row else self._empty()
 
-    def _save(self, state):
+    def _save(self, state, pg_connection):
+        if pg_connection is not None:
+            pg_connection.execute('INSERT INTO market_quotes VALUES (1, %s) '
+                                  'ON CONFLICT (id) DO UPDATE SET payload = excluded.payload',
+                                  (json.dumps(state),))
+            return
+
         with closing(sqlite3.connect(self.path, timeout=15)) as connection, connection:
             connection.execute('CREATE TABLE IF NOT EXISTS market_quotes (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
             connection.execute('INSERT OR REPLACE INTO market_quotes VALUES (1, ?)', (json.dumps(state),))
 
-    def refresh_due(self):
-        # A nonblocking OS lease prevents duplicate HTTP across threads/processes.
-        # The persisted reservation also survives restarts and request failures.
+    @contextmanager
+    def _poll_lock(self):
+        if self.database is not None:
+            with self.database.locked_connection('market:quotes') as connection:
+                yield connection is not None, connection
+            return
+
         lease = FileLease(self.path.with_suffix('.lock'))
         try:
             lease.acquire()
         except RuntimeError:
-            return False
+            yield False, None
+            return
         try:
-            state = self.snapshot()
+            yield True, None
+        finally:
+            lease.release()
+
+    def refresh_due(self):
+        # The lock prevents duplicate HTTP across workers. The committed
+        # reservation survives restarts and failed requests. PostgreSQL writes
+        # use the lock's session so a connection loss also discards its results.
+        with self._poll_lock() as (acquired, connection):
+            if not acquired:
+                return False
+            state = self._postgres_snapshot(connection) if connection is not None else self.snapshot()
             now = self.clock()
             if now < state['next_poll']:
                 return False
             state['next_poll'] = now + self.POLL_SECONDS
-            self._save(state)
+            self._save(state, connection)
             try:
                 response = self.get(self.URL, timeout=15)
                 response.raise_for_status()
@@ -102,10 +147,8 @@ class MarketQuotes:
                     if math.isfinite(delay):
                         wait = max(wait, delay)
                 state['next_poll'] = self.clock() + wait
-            self._save(state)
+            self._save(state, connection)
             return True
-        finally:
-            lease.release()
 
     def quote(self, symbol, *, snapshot=None):
         state = self.snapshot() if snapshot is None else snapshot
@@ -123,9 +166,12 @@ class MarketQuotes:
 
 
 @lru_cache(maxsize=8)
-def _shared_quotes(path):
-    return MarketQuotes(path)
+def _shared_quotes(path, database=None):
+    return MarketQuotes(path, database=database)
 
 
 def shared_market_quotes():
+    database = get_database()
+    if database is not None:
+        return _shared_quotes(None, database)
     return _shared_quotes(str(data_dir() / 'market-quotes.sqlite3'))
