@@ -1,6 +1,6 @@
 # Cryptocurrency deep learning forecast design
 
-Build a standalone research package in this folder, as requested in the current conversation. The existing handoff supplies context and a candidate universe; the current request selects deep learning and narrows the deliverable to historical forecasting, training, and validation. There is no order execution in this package.
+Build a standalone deep learning research package for historical forecasting, training, and validation. The [spot portfolio manager requirements](spot-portfolio-manager-requirements.md) define the candidate asset universe. Order execution is outside the scope of this package.
 
 ## Outputs and selected assets
 

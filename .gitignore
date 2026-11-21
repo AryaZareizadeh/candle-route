@@ -7,7 +7,6 @@ __pycache__/
 .env.*
 !.env.example
 docker.env
-CLAUDE.md
 
 # Local environments, test output, and durable runtime state
 .venv*/
@@ -30,4 +29,13 @@ test-results/
 .dashboard.lock
 *.bundle.zip
 bot_params_comparison.png
-.gstack/
+
+# Root-level local notes and hidden workspace directories
+/[A-Z]*.md
+!/README.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/LICENSE.md
+/.*/
+!/.github/

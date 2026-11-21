@@ -1,7 +1,5 @@
 # Project Review Remediation Implementation Plan
 
-> **For agentic workers:** Use superpowers:subagent-driven-development to implement and review the independent workstreams. Checkboxes track implementation and verification.
-
 **Goal:** Repair all twelve review findings and implement the six operational, validation, CI, coordination, observability, and maintainability improvements.
 
 **Architecture:** Preserve the single-process FastAPI dashboard, SQLite authority, per-user stores, stopped-on-restart behavior, and existing API contracts. Introduce small shared lifecycle, scheduling, settlement, backup, and monitoring units where they remove duplicated safety logic. Use separate offline regressions for temporal correctness, recovery, session isolation, and resource contention.
@@ -18,7 +16,7 @@
 - Keep migrations compatible and restore bots stopped. Persist order resolution and runtime together.
 - Reject uncertainty conservatively; `Expired`/`Liquidated` can still await system settlement.
 - Keep GPU training serialized, but do not occupy live HTTP executor workers while queued.
-- Tests use isolated storage and synthetic providers. Root owns full-suite integration verification; agents run focused regressions without duplicating full suites concurrently.
+- Tests use isolated storage and synthetic providers. Run focused regressions for each module and the full test suite after integration.
 - The user explicitly authorized planning and execution together. Continue through phases without another plan approval gate.
 
 ## Review focus

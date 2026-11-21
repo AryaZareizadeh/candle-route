@@ -1,7 +1,7 @@
-.git
-.claude
-CLAUDE.md
-.github
+# Root-level workspace files and local notes
+.*
+*.md
+!README.md
 forecasting/.dashboard
 forecasting/.kronos-deps
 forecasting/.test-tmp

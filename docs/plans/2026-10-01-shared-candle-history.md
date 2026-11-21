@@ -56,7 +56,7 @@ Files: `README.md`, this plan.
 5. Historical Tehran alignment and calendar-month duration must not be replaced by a UTC floor or a fixed 30-day month.
 6. Concurrent callers must recheck the database after acquiring a series lock, and successful pages must survive later cancellation or failures.
 
-Execution is authorized by the user's request to plan and implement. Storage and spot integration run in parallel; the main agent implements `DataFetcher` and coordinates verification. Existing unrelated working-tree changes are preserved.
+Storage integration, spot integration, and the `DataFetcher` changes can proceed in parallel and are verified together.
 
 ## Verification results
 

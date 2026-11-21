@@ -1,7 +1,5 @@
 # Trading Bot Reliability Implementation Plan
 
-> **For agentic workers:** Use superpowers:executing-plans to implement this plan task-by-task after implementation is requested. Steps use checkbox syntax for tracking.
-
 **Goal:** Resolve the five identified limitations: incomplete dependencies, missing access control, volatile runtime state, simplified backtest economics, and documentation/test gaps.
 
 **Architecture:** Keep the Python/FastAPI backend and existing JavaScript dashboard. Add small modules for authentication, SQLite persistence, and simulated execution/accounting; integrate them into the existing bot and research flows. Deliver each stage as a separately reviewable change.
@@ -130,7 +128,7 @@ The lock-file name above is the proposed artifact to generate during implementat
 
 ## Stage 5 — Documentation, regression suite and release verification
 
-**Files:** Create README.md, docs/architecture.md, docs/backtesting.md, docs/operations.md and tests/test_dashboard_flow.py; update .env.example, main.py and .github/workflows/tests.yml. Update the local agent guidance to match tracked documentation.
+**Files:** Create README.md, docs/architecture.md, docs/backtesting.md, docs/operations.md and tests/test_dashboard_flow.py; update .env.example, main.py and .github/workflows/tests.yml.
 
 - [ ] Document the actual Python/FastAPI/plain-JavaScript architecture and Nobitex execution versus Binance research data. Explain each strategy and retain the ExtremeReversal beta label.
 - [ ] Document clean installation, password setup, dashboard startup, credential configuration, simulation, optimization, train/test evaluation, database backup and restart reconciliation. List supported Python/platform versions established by Stage 1 verification.

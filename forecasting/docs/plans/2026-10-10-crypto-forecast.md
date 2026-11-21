@@ -1,14 +1,12 @@
 # Cryptocurrency Forecast Implementation Plan
 
-> For agentic workers: parallelize independent data and feature modules, then integrate and review the complete pipeline.
-
 **Goal:** Deliver a configurable deep learning model trained and validated on selected coins with 1-, 7-, and 30-day price forecasts.
 
 **Architecture:** Four OHLCV resolutions (15m, 1h, 4h, 1d) feed separate causal GRU encoders, whose outputs are fused into one forecast head. Four-hour forecast origins use globally purged chronological datasets, validation-only model selection, reproducible artifacts, and held-out comparisons. The original daily mode remains supported.
 
 **Tech Stack:** Python 3.11+, NumPy, pandas, PyTorch, pytest, standard-library HTML/CSV/HTTP.
 
-**Spec:** `docs/superpowers/specs/2026-10-10-crypto-forecast-design.md`
+**Spec:** [Cryptocurrency forecasting design](../specs/2026-10-10-crypto-forecast-design.md)
 
 ## Global constraints
 

@@ -1,8 +1,6 @@
-# Project handoff: adaptive spot portfolio management
+# Adaptive spot portfolio manager requirements
 
-I want to extend my existing `Trading-bot-Nobitex` project with an adaptive, machine-learning-based spot portfolio manager. This prompt records the requirements and research from a separate design conversation. Treat the confirmed requirements as settled; ask only about consequential gaps that cannot be resolved by inspecting the project or making a clearly stated, reversible assumption.
-
-The repository is `D:\GitHub\Trading-bot-Nobitex`.
+The adaptive spot portfolio manager extends `Trading-bot-Nobitex` with machine-learning-based allocation. This specification records the design requirements and research for that extension.
 
 ## 1. Objective and confirmed requirements
 
@@ -33,7 +31,7 @@ A read-only inspection on September 27, 2026 found:
 - `price_ai.py` already contains a simulation-only `PriceAI` using scikit-learn `HistGradientBoostingRegressor`. It predicts four-candle returns, uses a fixed training boundary, and supports long/short decisions through the existing simulator. This is a useful baseline, but it is not yet the requested multi-asset spot allocator.
 - `data.py` retrieves Nobitex/Binance candles.
 - `execution_model.py`, `accounting.py`, `backtester.py`, and `optimizer.py` provide research and accounting infrastructure, much of it oriented around margin positions.
-- `portfolio.py` and the Portfolio tab already provide USDT valuation, cash-flow-adjusted performance, manually supplied targets, and indicative rebalancing ideas. The inspected target validation caps each risky asset at 35% and requires at least 20% USDT; these are existing implementation policies, not preferences established in this conversation.
+- `portfolio.py` and the Portfolio tab already provide USDT valuation, cash-flow-adjusted performance, manually supplied targets, and indicative rebalancing ideas. The inspected target validation caps each risky asset at 35% and requires at least 20% USDT. These caps describe the existing implementation.
 - `exchange_execution.py` provides durable order-intent/reconciliation patterns, but its existing execution path is margin-oriented.
 - The repository had substantial uncommitted work. Preserve and account for it. Do not overwrite changes, reset the checkout, or assume the working tree is clean.
 - Some documentation disagrees with newer code. Verify current behavior in code and tests before deciding what to reuse. For Nobitex API work, check the repository's local API index and matched references as well as current official documentation.
@@ -52,7 +50,7 @@ Nobitex's lower volume does not make its executable prices irrelevant. A Binance
 
 I have authorized additional reliable historical spot-data sources when Binance history is insufficient:
 
-| Asset | Historical source | Evidence verified in the design conversation |
+| Asset | Historical source | Evidence recorded during design |
 |---|---|---|
 | HYPE/USDT | KuCoin spot | Public API returned hourly candles beginning December 7, 2024 at 15:00 UTC, and daily candles from the launch period. |
 | XAUT/USDT | Bitfinex spot | Public API returned hourly candles beginning January 25, 2020 at 09:00 UTC, daily candles from January 2020, and recent September 2026 candles. Bitfinex identifies this pair as `tXAUT:UST`; its `UST` symbol means Tether USDT. |
@@ -176,4 +174,4 @@ Keep the first implementation focused on research and paper trading. Do not requ
 
 Add meaningful tests for temporal leakage, cash conservation, trading costs, source normalization, order constraints, drawdown accounting, multi-asset budget sharing, persistence, and per-user isolation. Preserve existing margin bots and regression coverage. Update documentation to match the implemented behavior.
 
-Present important unresolved design choices with a recommendation. Avoid asking again about requirements settled above, avoid unnecessary infrastructure for a 200 USDT initial portfolio, and distinguish a working implementation from evidence that its strategy is profitable.
+Record unresolved design choices and their trade-offs. Keep infrastructure proportionate to a 200 USDT initial portfolio and evaluate profitability independently of implementation readiness.
